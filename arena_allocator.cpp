@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <mutex>
 #include <sys/mman.h>
 #include <vector>
 
@@ -46,10 +47,11 @@ struct Arena {
     size_t slot_size;
     // This likely has room for optimization. Using a vector doesn't seem like the best of ideas. Right now the bool at
     // index will indicate its status. 1 means in use, 0 means not in use or freed.
-    // TODO: Check if this needs thread protection as well. It likely does.
     // TODO: Check if there is a better way to accomplish this tracking 1byte for each slot seems a little inefficient.
     // Index of slots in use.
     std::vector<bool> used_slots_map;
+    // Mutex to protect used_slots_map for thread safety.
+    std::mutex slots_map_mutex;
     // Planning on the max arena size being 20MB and the page size being 4KB which means I can a maximum of 5120 slots.
     // A 16 bit unsigned integer should suffice for that purpose. A 32 bit unsigned integer might be better for
     // alignment I don't know yet.
@@ -123,6 +125,11 @@ char* arena_allocate(Arena* arena, size_t size) {
     size_t slots_required = (size + arena->slot_size - 1) / arena->slot_size;
     char* allocation_base = NULL;
 
+    // Neat wrapper right here, it makes sure the lock is released even if the function that locked it thorws an
+    // exception.
+    // TODO: Check if this would incur any overhead and if manual operations are preferred.
+    std::lock_guard<std::mutex> lock(arena->slots_map_mutex);
+
     // This is likely once again not the best way to do things.
     // TODO: Optmize this.
     for (int i = 0; i < arena->used_slots_map.size(); ++i) {
@@ -171,6 +178,8 @@ void arena_free(Arena* arena, char* ptr, size_t size) {
 
     size_t start_slot = (ptr - arena->base) / arena->slot_size;
     size_t slots_to_free = (size + arena->slot_size - 1) / arena->slot_size;
+
+    std::lock_guard<std::mutex> lock(arena->slots_map_mutex);
 
     for (size_t i = start_slot; i < start_slot + slots_to_free && i < arena->used_slots_map.size(); ++i) {
         arena->used_slots_map[i] = false;
