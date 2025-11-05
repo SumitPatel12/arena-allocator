@@ -13,8 +13,8 @@
      - The total size of the arena.
      - The starting point of the arena.
      - The fixed size of each page.
-     - Some kind of mechanism that would let me know which page/slot is in use
-       and which is not. This one keeps track of index.
+     - Some kind of mechanism that would let me know which page/slot is in use and which is not. This one keeps track of
+       index.
      - Total slots in use currently. This is just a number.
    The data to be stores will be per byte basis so something like a u8, mostly some kind of container of u8.
 
@@ -24,6 +24,7 @@
 
    Thats everything I can think of now. The buffer pool will likely wrap the arena into a struct to keep trak of the
    areana and some of its own metadata. Something I will deal with down the line :shrug:.
+   This implementation is just an exploratory one.
 */
 /*
    You'll see things like :shrug:, :laugh:, etc, throughout the code, my editor does not support showing emotes I just
@@ -45,10 +46,9 @@ struct Arena {
     char* base;
     // The frame/slot size.
     size_t slot_size;
-    // This likely has room for optimization. Using a vector doesn't seem like the best of ideas. Right now the bool at
-    // index will indicate its status. 1 means in use, 0 means not in use or freed.
-    // TODO: Check if there is a better way to accomplish this tracking 1byte for each slot seems a little inefficient.
     // Index of slots in use.
+    // FIXME: Use a BitMap with a SpinLock: https://forum.osdev.org/viewtopic.php?t=29520, bool is too much overhead,
+    // and it seems like bitmap operations are quite fast.
     std::vector<bool> used_slots_map;
     // Mutex to protect used_slots_map for thread safety.
     std::mutex slots_map_mutex;
