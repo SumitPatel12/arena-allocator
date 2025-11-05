@@ -1,0 +1,184 @@
+// TODO: There are a lot of comments, after the implementation and benchmarkin are done remove the unnecessary ones.
+
+/*
+   The main target for this exercise is to get a feel for arena-allocators. It seems like a framed/slotted
+   arena-allocator would be a good fit for buffer pools.
+
+   For use in a buffer pool, I need pages, fixed size. There may be two different sizes to consider since the log page
+   and the actual data pages might differ in size but for now lets just consider one size fits all.
+
+   So what should the Arena keep track of?
+   Listing some of the things that come
+   to mind:
+     - The total size of the arena.
+     - The starting point of the arena.
+     - The fixed size of each page.
+     - Some kind of mechanism that would let me know which page/slot is in use
+       and which is not. This one keeps track of index.
+     - Total slots in use currently. This is just a number.
+   The data to be stores will be per byte basis so something like a u8, mostly some kind of container of u8.
+
+   The whole thing will likely be shared across threads since the Buffer pool is initialized only once, when the DB is
+   created. So to keep count of the number of currently allocated slots we'd need a type that supports atomic operations
+   for thread safety.
+
+   Thats everything I can think of now. The buffer pool will likely wrap the arena into a struct to keep trak of the
+   areana and some of its own metadata. Something I will deal with down the line :shrug:.
+*/
+/*
+   You'll see things like :shrug:, :laugh:, etc, throughout the code, my editor does not support showing emotes I just
+   like sprinking those around, makes coding FUN, especially when you revisit your code.
+*/
+
+#include <atomic>
+#include <cstddef>
+#include <sys/mman.h>
+#include <vector>
+
+// TODO: Understand the impact and significance of alignment.
+// Framed/Slotted arena, all allocation will be of the same size.
+struct Arena {
+    // Capacity of the arena
+    size_t capacity;
+    // Pointer to the base of the arena.
+    char* base;
+    // The frame/slot size.
+    size_t slot_size;
+    // This likely has room for optimization. Using a vector doesn't seem like the best of ideas. Right now the bool at
+    // index will indicate its status. 1 means in use, 0 means not in use or freed.
+    // TODO: Check if this needs thread protection as well. It likely does.
+    // TODO: Check if there is a better way to accomplish this tracking 1byte for each slot seems a little inefficient.
+    // Index of slots in use.
+    std::vector<bool> used_slots_map;
+    // Planning on the max arena size being 20MB and the page size being 4KB which means I can a maximum of 5120 slots.
+    // A 16 bit unsigned integer should suffice for that purpose. A 32 bit unsigned integer might be better for
+    // alignment I don't know yet.
+    // TODO: After implementation check with a 32 bit integer.
+    // TODO: Turns out for MacOS (which I use) the page size is 16KB. Test the alignment and allocation with 4KB, 8KB,
+    // and 16KB.
+    // Total number of slots being used at any given point. Needs to be thread safe.
+    std::atomic_int16_t slots_in_use;
+};
+
+// Well be going the route of mmap for this one: https://stackoverflow.com/questions/45972/mmap-vs-reading-blocks
+// Since the buffer_pool would live for as long as the DB instance does, and we'll be accessing randomly, that seems to
+// make more sense. I'll benchmark the difference b/w malloc and mmap once I'm done with the initialization. Arena will
+// default to a 20MB region with a page size of 4KB.
+//
+// The capacity will be adjusted so that it is an exact multiple of page_size.
+// Ideally the page_size will be a power of 2 for good memory alignment.
+Arena* arena_create(size_t capacity = 1024 * 1024 * 8 * 20, size_t page_size = 1024 * 8 * 4) {
+    // I don't know why anyone would do this, but I'll assume there's someone out there who will try this. I am among
+    // them :laughing_face:
+    if (capacity == 0) {
+        return NULL;
+    }
+
+    // For the buffer pool we'll have to read and write the pages, the memory is not backed by a file, and it's private
+    // to our process.
+    void* arena_start = mmap(NULL, capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+    // TODO: Double check if panicking is the right thing to do.
+    // Not sure if we should panic but it'll do for now.
+    if (arena_start == MAP_FAILED) {
+        perror("mmap failed");
+        exit(EXIT_FAILURE);
+    }
+
+    Arena* arena = new Arena();
+
+    // Capacity is adjusted to be an exact multiple of page_size
+    arena->capacity = ((capacity + page_size - 1) / page_size) * page_size;
+    arena->slot_size = page_size;
+    // TODO: Check if the total number of slots need to be a multiple of 2 or something for memory alignment or some
+    // other stuff. I really need to get a better understanding of memory alignment and cache lines.
+    arena->used_slots_map.resize(arena->capacity / arena->slot_size, false);
+    arena->base = (char*)arena_start;
+    arena->slots_in_use.store(0);
+
+    return arena;
+};
+
+void arena_destroy(Arena* arena) {
+    if (arena != NULL) {
+        int unmapped = munmap(arena->base, arena->capacity);
+
+        // Panicking here is mighty incorrect I think. But once again I'll let it slide for now.
+        if (unmapped == -1) {
+            perror("mmap failed");
+            exit(EXIT_FAILURE);
+        }
+
+        delete arena;
+    }
+}
+
+// TODO: Think of how the allocation strategy should work. The size of page requests are going to be a multiple of the
+// arena page_size. To avoid fragmentation and have some space for contiguous blocks a better strategy would be needed,
+// for now we'll just go with allocating by iterating over the vector and finding the first match.
+char* arena_allocate(Arena* arena, size_t size) {
+    if (size == 0 || arena == NULL) {
+        return NULL;
+    }
+    size_t slots_required = (size + arena->slot_size - 1) / arena->slot_size;
+    char* allocation_base = NULL;
+
+    // This is likely once again not the best way to do things.
+    // TODO: Optmize this.
+    for (int i = 0; i < arena->used_slots_map.size(); ++i) {
+        if (slots_required == 1 && !arena->used_slots_map[i]) {
+            arena->used_slots_map[i] = true;
+            allocation_base = arena->base + arena->slot_size * i;
+            arena->slots_in_use.fetch_add(1);
+            break;
+        }
+
+        if (!arena->used_slots_map[i]) {
+            int j = i;
+            // Check for contigious blocks only, so we short-circuit if we find any occupied slots before we reach our
+            // required count.
+            while (j < arena->used_slots_map.size() && !arena->used_slots_map[j] && (j - i + 1) != slots_required) {
+                ++j;
+            }
+
+            // Need to recheck the condition again cause anything could be wrong here.
+            if (j < arena->used_slots_map.size() && !arena->used_slots_map[j] && (j - i + 1) == slots_required) {
+                for (int k = i; k <= j; ++k) {
+                    arena->used_slots_map[k] = true;
+                }
+
+                allocation_base = arena->base + arena->slot_size * i;
+                arena->slots_in_use.fetch_add(slots_required);
+                break;
+            }
+            // Since we either reached the end or j was at a slot that was occupied we'd rather skip that index.
+            i = j + 1;
+        }
+    }
+
+    return allocation_base;
+}
+
+// Finally a one that's simple :wiping_sweat:
+void arena_free(Arena* arena, char* ptr, size_t size) {
+    if (arena == NULL || ptr == NULL || size == 0) {
+        return;
+    }
+
+    if (ptr < arena->base || ptr >= arena->base + arena->capacity) {
+        return;
+    }
+
+    size_t start_slot = (ptr - arena->base) / arena->slot_size;
+    size_t slots_to_free = (size + arena->slot_size - 1) / arena->slot_size;
+
+    for (size_t i = start_slot; i < start_slot + slots_to_free && i < arena->used_slots_map.size(); ++i) {
+        arena->used_slots_map[i] = false;
+    }
+
+    arena->slots_in_use.fetch_sub(slots_to_free);
+}
+
+int main() {
+    return 0;
+}
