@@ -176,6 +176,8 @@ void arena_free(Arena* arena, char* ptr, size_t size) {
         return;
     }
 
+    // TODO: Check if this needs to be ceiled, probably yes.
+    // I see why OS always talks about never trusting the user.
     size_t start_slot = (ptr - arena->base) / arena->slot_size;
     size_t slots_to_free = (size + arena->slot_size - 1) / arena->slot_size;
 
