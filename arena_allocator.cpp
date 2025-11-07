@@ -60,44 +60,53 @@ struct Arena {
     // and 16KB.
     // Total number of slots being used at any given point. Needs to be thread safe.
     std::atomic_int16_t slots_in_use;
+
+    // Well be going the route of mmap for this one: https://stackoverflow.com/questions/45972/mmap-vs-reading-blocks
+    // Since the buffer_pool would live for as long as the DB instance does, and we'll be accessing randomly, that seems
+    // to make more sense. I'll benchmark the difference b/w malloc and mmap once I'm done with the initialization.
+    // Arena will default to a 20MB region with a page size of 4KB.
+    //
+    // The capacity will be adjusted so that it is an exact multiple of page_size.
+    // Ideally the page_size will be a power of 2 for good memory alignment.
+    // For the bitmap implementation the number of slots in the arena need to be a multiple of 64.
+    Arena(size_t capacity, size_t page_size) {
+        // Calculate initial number of slots that would fit
+        size_t num_slots = (capacity + page_size - 1) / page_size;
+
+        // Ensure minimum of 64 slots, or round up to next multiple of 64
+        if (num_slots < 64) {
+            num_slots = 64;
+        } else {
+            num_slots = ((num_slots + 63) / 64) * 64;
+        }
+
+        // Capacity is adjusted to be an exact multiple of page_size and slot count
+        this->capacity = num_slots * page_size;
+        this->slot_size = page_size;
+
+        // For the buffer pool we'll have to read and write the pages, the memory is not backed by a file, and it's
+        // private to our process.
+        void* arena_start = mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+        // TODO: Double check if panicking is the right thing to do.
+        // Not sure if we should panic but it'll do for now.
+        if (arena_start == MAP_FAILED) {
+            perror("mmap failed");
+            exit(EXIT_FAILURE);
+        }
+
+        this->used_slots_map.resize(num_slots, false);
+        this->base = (char*)arena_start;
+        this->slots_in_use.store(0);
+    }
 };
 
-// Well be going the route of mmap for this one: https://stackoverflow.com/questions/45972/mmap-vs-reading-blocks
-// Since the buffer_pool would live for as long as the DB instance does, and we'll be accessing randomly, that seems to
-// make more sense. I'll benchmark the difference b/w malloc and mmap once I'm done with the initialization. Arena will
-// default to a 20MB region with a page size of 4KB.
-//
-// The capacity will be adjusted so that it is an exact multiple of page_size.
-// Ideally the page_size will be a power of 2 for good memory alignment.
 Arena* arena_create(size_t capacity = 1024 * 1024 * 8 * 20, size_t page_size = 1024 * 8 * 4) {
-    // I don't know why anyone would do this, but I'll assume there's someone out there who will try this. I am among
-    // them :laughing_face:
     if (capacity == 0) {
         return NULL;
     }
 
-    // For the buffer pool we'll have to read and write the pages, the memory is not backed by a file, and it's private
-    // to our process.
-    void* arena_start = mmap(NULL, capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-
-    // TODO: Double check if panicking is the right thing to do.
-    // Not sure if we should panic but it'll do for now.
-    if (arena_start == MAP_FAILED) {
-        perror("mmap failed");
-        exit(EXIT_FAILURE);
-    }
-
-    Arena* arena = new Arena();
-
-    // Capacity is adjusted to be an exact multiple of page_size
-    arena->capacity = ((capacity + page_size - 1) / page_size) * page_size;
-    arena->slot_size = page_size;
-    // TODO: Check if the total number of slots need to be a multiple of 2 or something for memory alignment or some
-    // other stuff. I really need to get a better understanding of memory alignment and cache lines.
-    arena->used_slots_map.resize(arena->capacity / arena->slot_size, false);
-    arena->base = (char*)arena_start;
-    arena->slots_in_use.store(0);
-
+    Arena* arena = new Arena(capacity, page_size);
     return arena;
 };
 
