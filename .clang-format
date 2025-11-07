@@ -1,7 +1,7 @@
 ---
 # Clang-Format configuration for C++17
 Language: Cpp
-Standard: c++17
+Standard: c++20
 ColumnLimit: 120
 
 # Indentation

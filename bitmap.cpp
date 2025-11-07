@@ -20,6 +20,10 @@ struct Bitmap {
     std::uint32_t WORD_SHIFT = 6;
     std::uint32_t WORD_LENGTH = 64;
     std::uint32_t WORD_MASK = 63;
+    std::uint64_t FULLY_ALLOCATED = 0;
+    std::uint64_t FULLY_FREE = UINT64_MAX;
+    // I could likely resuse the mask since it's the same value but that wouldn't be very readable.
+    std::uint64_t MAX_IDX = 63;
 
     uint32_t num_slots;
     std::vector<uint64_t> words;
@@ -38,6 +42,7 @@ struct Bitmap {
 
     std::pair<size_t, uint32_t> get_word_index_from_slot_index(uint32_t slot_idx) const;
     size_t get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const;
+    int allocate_one();
 };
 
 /// Returns the word and bit index given the slot index.
@@ -51,4 +56,21 @@ std::pair<size_t, uint32_t> Bitmap::get_word_index_from_slot_index(uint32_t slot
 /// Returns the slot_index given the word, and bit index
 size_t Bitmap::get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const {
     return word_idx >> WORD_SHIFT | bit_idx;
+}
+
+// Just scanning and allocating the first free slot is likely going to result in internal fragmentation. Will do for the
+// first pass.
+/// Allocates one free slot from the bitmap, returns the index of the bitmap if allocation was successful, -1 otherwise.
+int Bitmap::allocate_one() {
+    for (size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+        uint64_t word = words[word_idx];
+        if (word != FULLY_ALLOCATED) {
+            // Count trailing zeros subtract from 63 since we're counting from the back.
+            int bit_idx = MAX_IDX - std::countr_zero(word);
+            // Since we're allocating the slot, we need to set it to 0.
+            words[word_idx] &= ~(1ULL << bit_idx);
+            return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
+        }
+    }
+    return -1;
 }
