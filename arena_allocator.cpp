@@ -49,6 +49,7 @@ struct Arena {
     // Index of slots in use.
     // FIXME: Use a BitMap with a SpinLock: https://forum.osdev.org/viewtopic.php?t=29520, bool is too much overhead,
     // and it seems like bitmap operations are quite fast.
+    // Actually I'm not sure if its should be a spinlock or mutex :shrug:.
     std::vector<bool> used_slots_map;
     // Mutex to protect used_slots_map for thread safety.
     std::mutex slots_map_mutex;
@@ -77,7 +78,11 @@ struct Arena {
         if (num_slots < 64) {
             num_slots = 64;
         } else {
-            num_slots = ((num_slots + 63) / 64) * 64;
+            // Bit manipulation way of getting to the next multiple of 64.
+            // Neat trick, we add a 63 to get the current atleast to the next multiple of 64 then just logical & with
+            // the compliemnt of 63 meaning we make the number divisible by 64. In this case it sets the las 5 bits to 0
+            // which ensures that the number is divisible by 64.
+            num_slots = (num_slots + 63) & !63;
         }
 
         // Capacity is adjusted to be an exact multiple of page_size and slot count
