@@ -55,7 +55,7 @@ std::pair<size_t, uint32_t> Bitmap::get_word_index_from_slot_index(uint32_t slot
 
 /// Returns the slot_index given the word, and bit index
 size_t Bitmap::get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const {
-    return word_idx >> WORD_SHIFT | bit_idx;
+    return word_idx << WORD_SHIFT | bit_idx;
 }
 
 // Just scanning and allocating the first free slot is likely going to result in internal fragmentation. Will do for the
