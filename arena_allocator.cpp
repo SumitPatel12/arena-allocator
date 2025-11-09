@@ -183,9 +183,6 @@ void arena_free(Arena* arena, char* ptr, size_t size) {
     arena->slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
 }
 
-// Note: main() is defined in arena_benchmark.cpp when compiling benchmarks
-#ifndef BENCHMARK_MAIN_DEFINED
 int main() {
     return 0;
 }
-#endif
