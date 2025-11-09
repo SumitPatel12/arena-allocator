@@ -40,13 +40,15 @@ struct Bitmap {
         words.assign(num_words, (uint64_t)1);
     }
 
-    std::pair<size_t, uint32_t> get_word_index_from_slot_index(uint32_t slot_idx) const;
+    std::pair<size_t, uint32_t> get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const;
     size_t get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const;
     int allocate_one();
+    int allocate_many(uint32_t num_slots);
+    int free_slot(uint32_t slot_idx);
 };
 
 /// Returns the word and bit index given the slot index.
-std::pair<size_t, uint32_t> Bitmap::get_word_index_from_slot_index(uint32_t slot_idx) const {
+inline std::pair<size_t, uint32_t> Bitmap::get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const {
     // for unsigned ints >> is equivalent to divide by power of 2 so thats pretty much it for the first one.
     // Since each number is to map to a word, we're only interested in the last 6 bits (i.e. the remainder after
     // dividing by 64) since that would give us the index in the word.
@@ -54,23 +56,37 @@ std::pair<size_t, uint32_t> Bitmap::get_word_index_from_slot_index(uint32_t slot
 }
 
 /// Returns the slot_index given the word, and bit index
-size_t Bitmap::get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const {
+inline size_t Bitmap::get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const {
     return word_idx << WORD_SHIFT | bit_idx;
 }
 
 // Just scanning and allocating the first free slot is likely going to result in internal fragmentation. Will do for the
 // first pass.
 /// Allocates one free slot from the bitmap, returns the index of the bitmap if allocation was successful, -1 otherwise.
-int Bitmap::allocate_one() {
+inline int Bitmap::allocate_one() {
     for (size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
         uint64_t word = words[word_idx];
         if (word != FULLY_ALLOCATED) {
-            // Count trailing zeros subtract from 63 since we're counting from the back.
-            int bit_idx = MAX_IDX - std::countr_zero(word);
+            // Count trailing zeros, subtract from 63 since we're counting from the back.
+            // For example consider the second bit in the 3rd word.
+            // W0 W1 W2 0100... -> W3a          (Wlen - bit_idx)
+            // Then the index should be 3 * 64 + (63 - 1) = 254 Which is correct, since slot index themsef start at 0.
+            int bit_idx = MAX_IDX - std::countl_zero(word);
             // Since we're allocating the slot, we need to set it to 0.
             words[word_idx] &= ~(1ULL << bit_idx);
             return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
         }
     }
     return -1;
+}
+
+inline int Bitmap::allocate_many(uint32_t num_slots) {
+    return -1;
+}
+
+inline int Bitmap::free_slot(uint32_t slot_idx) {
+    size_t word_idx, bit_idx;
+    std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
+    words[word_idx] |= (1ULL << bit_idx);
+    return 0;
 }

@@ -31,11 +31,12 @@
    like sprinking those around, makes coding FUN, especially when you revisit your code.
 */
 
+#include "bitmap.h"
+
 #include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <sys/mman.h>
-#include <vector>
 
 // TODO: Understand the impact and significance of alignment.
 // Framed/Slotted arena, all allocation will be of the same size.
@@ -50,9 +51,9 @@ struct Arena {
     // FIXME: Use a BitMap with a SpinLock: https://forum.osdev.org/viewtopic.php?t=29520, bool is too much overhead,
     // and it seems like bitmap operations are quite fast.
     // Actually I'm not sure if its should be a spinlock or mutex :shrug:.
-    std::vector<bool> used_slots_map;
-    // Mutex to protect used_slots_map for thread safety.
-    std::mutex slots_map_mutex;
+    Bitmap* bitmap;
+    // Mutex to protect bitmap for thread safety.
+    std::mutex bitmap_mutex;
     // Planning on the max arena size being 20MB and the page size being 4KB which means I can a maximum of 5120 slots.
     // A 16 bit unsigned integer should suffice for that purpose. A 32 bit unsigned integer might be better for
     // alignment I don't know yet.
@@ -100,7 +101,7 @@ struct Arena {
             exit(EXIT_FAILURE);
         }
 
-        this->used_slots_map.resize(num_slots, false);
+        this->bitmap = new Bitmap(num_slots);
         this->base = (char*)arena_start;
         this->slots_in_use.store(0);
     }
@@ -125,13 +126,14 @@ void arena_destroy(Arena* arena) {
             exit(EXIT_FAILURE);
         }
 
+        delete arena->bitmap;
         delete arena;
     }
 }
 
 // TODO: Think of how the allocation strategy should work. The size of page requests are going to be a multiple of the
 // arena page_size. To avoid fragmentation and have some space for contiguous blocks a better strategy would be needed,
-// for now we'll just go with allocating by iterating over the vector and finding the first match.
+// for now we'll just go with allocating by iterating over the bitmap and finding the first match.
 char* arena_allocate(Arena* arena, size_t size) {
     if (size == 0 || arena == NULL) {
         return NULL;
@@ -142,38 +144,13 @@ char* arena_allocate(Arena* arena, size_t size) {
     // Neat wrapper right here, it makes sure the lock is released even if the function that locked it thorws an
     // exception.
     // TODO: Check if this would incur any overhead and if manual operations are preferred.
-    std::lock_guard<std::mutex> lock(arena->slots_map_mutex);
+    std::lock_guard<std::mutex> lock(arena->bitmap_mutex);
 
-    // This is likely once again not the best way to do things.
-    // TODO: Optmize this.
-    for (int i = 0; i < arena->used_slots_map.size(); ++i) {
-        if (slots_required == 1 && !arena->used_slots_map[i]) {
-            arena->used_slots_map[i] = true;
-            allocation_base = arena->base + arena->slot_size * i;
-            arena->slots_in_use.fetch_add(1);
-            break;
-        }
-
-        if (!arena->used_slots_map[i]) {
-            int j = i;
-            // Check for contigious blocks only, so we short-circuit if we find any occupied slots before we reach our
-            // required count.
-            while (j < arena->used_slots_map.size() && !arena->used_slots_map[j] && (j - i + 1) != slots_required) {
-                ++j;
-            }
-
-            // Need to recheck the condition again cause anything could be wrong here.
-            if (j < arena->used_slots_map.size() && !arena->used_slots_map[j] && (j - i + 1) == slots_required) {
-                for (int k = i; k <= j; ++k) {
-                    arena->used_slots_map[k] = true;
-                }
-
-                allocation_base = arena->base + arena->slot_size * i;
-                arena->slots_in_use.fetch_add(slots_required);
-                break;
-            }
-            // Since we either reached the end or j was at a slot that was occupied we'd rather skip that index.
-            i = j + 1;
+    if (slots_required == 1) {
+        int slot_idx = arena->bitmap->allocate_one();
+        if (slot_idx != -1) {
+            allocation_base = arena->base + arena->slot_size * slot_idx;
+            arena->slots_in_use.fetch_add(1, std::memory_order_acquire);
         }
     }
 
@@ -195,13 +172,13 @@ void arena_free(Arena* arena, char* ptr, size_t size) {
     size_t start_slot = (ptr - arena->base) / arena->slot_size;
     size_t slots_to_free = (size + arena->slot_size - 1) / arena->slot_size;
 
-    std::lock_guard<std::mutex> lock(arena->slots_map_mutex);
+    std::lock_guard<std::mutex> lock(arena->bitmap_mutex);
 
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < arena->used_slots_map.size(); ++i) {
-        arena->used_slots_map[i] = false;
+    for (size_t i = start_slot; i < start_slot + slots_to_free && i < arena->bitmap->num_slots; ++i) {
+        arena->bitmap->free_slot(i);
     }
 
-    arena->slots_in_use.fetch_sub(slots_to_free);
+    arena->slots_in_use.fetch_sub(slots_to_free, std::memory_order_acquire);
 }
 
 int main() {
