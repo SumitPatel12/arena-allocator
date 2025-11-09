@@ -83,7 +83,7 @@ struct Arena {
             // Neat trick, we add a 63 to get the current atleast to the next multiple of 64 then just logical & with
             // the compliemnt of 63 meaning we make the number divisible by 64. In this case it sets the las 5 bits to 0
             // which ensures that the number is divisible by 64.
-            num_slots = (num_slots + 63) & !63;
+            num_slots = (num_slots + 63) & ~63;
         }
 
         // Capacity is adjusted to be an exact multiple of page_size and slot count
@@ -150,7 +150,8 @@ char* arena_allocate(Arena* arena, size_t size) {
         int slot_idx = arena->bitmap->allocate_one();
         if (slot_idx != -1) {
             allocation_base = arena->base + arena->slot_size * slot_idx;
-            arena->slots_in_use.fetch_add(1, std::memory_order_acquire);
+            // Since the mutex guards this area we do not need anything more than relaxed.
+            arena->slots_in_use.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -178,9 +179,13 @@ void arena_free(Arena* arena, char* ptr, size_t size) {
         arena->bitmap->free_slot(i);
     }
 
-    arena->slots_in_use.fetch_sub(slots_to_free, std::memory_order_acquire);
+    // Since the mutex guards this area we do not need anything more than relaxed.
+    arena->slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
 }
 
+// Note: main() is defined in arena_benchmark.cpp when compiling benchmarks
+#ifndef BENCHMARK_MAIN_DEFINED
 int main() {
     return 0;
 }
+#endif

@@ -5,6 +5,7 @@
 //
 // Oh and of course Bitmaps require bit manipulation and I suck at bit manipulation. :pulling_out_hair:
 
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -37,7 +38,7 @@ struct Bitmap {
         // Since each word is 64 bits long we just get the number by dividing slots by 64.
         size_t num_words = num_slots / WORD_LENGTH;
         // Initially all of the pages are free.
-        words.assign(num_words, (uint64_t)1);
+        words.assign(num_words, FULLY_FREE);
     }
 
     std::pair<size_t, uint32_t> get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const;
