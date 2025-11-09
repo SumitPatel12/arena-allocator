@@ -105,83 +105,59 @@ struct Arena {
         this->base = (char*)arena_start;
         this->slots_in_use.store(0);
     }
-};
 
-Arena* arena_create(size_t capacity = 1024 * 1024 * 8 * 20, size_t page_size = 1024 * 8 * 4) {
-    if (capacity == 0) {
-        return NULL;
-    }
+    ~Arena() {
+        int unmapped = munmap(base, capacity);
 
-    Arena* arena = new Arena(capacity, page_size);
-    return arena;
-};
-
-void arena_destroy(Arena* arena) {
-    if (arena != NULL) {
-        int unmapped = munmap(arena->base, arena->capacity);
-
-        // Panicking here is mighty incorrect I think. But once again I'll let it slide for now.
         if (unmapped == -1) {
-            perror("mmap failed");
+            perror("munmap failed");
             exit(EXIT_FAILURE);
         }
 
-        delete arena->bitmap;
-        delete arena;
+        delete bitmap;
     }
-}
 
-// TODO: Think of how the allocation strategy should work. The size of page requests are going to be a multiple of the
-// arena page_size. To avoid fragmentation and have some space for contiguous blocks a better strategy would be needed,
-// for now we'll just go with allocating by iterating over the bitmap and finding the first match.
-char* arena_allocate(Arena* arena, size_t size) {
-    if (size == 0 || arena == NULL) {
-        return NULL;
-    }
-    size_t slots_required = (size + arena->slot_size - 1) / arena->slot_size;
-    char* allocation_base = NULL;
-
-    // Neat wrapper right here, it makes sure the lock is released even if the function that locked it thorws an
-    // exception.
-    // TODO: Check if this would incur any overhead and if manual operations are preferred.
-    std::lock_guard<std::mutex> lock(arena->bitmap_mutex);
-
-    if (slots_required == 1) {
-        int slot_idx = arena->bitmap->allocate_one();
-        if (slot_idx != -1) {
-            allocation_base = arena->base + arena->slot_size * slot_idx;
-            // Since the mutex guards this area we do not need anything more than relaxed.
-            arena->slots_in_use.fetch_add(1, std::memory_order_relaxed);
+    char* allocate(size_t size) {
+        if (size == 0) {
+            return NULL;
         }
+        size_t slots_required = (size + slot_size - 1) / slot_size;
+        char* allocation_base = NULL;
+
+        std::lock_guard<std::mutex> lock(bitmap_mutex);
+
+        if (slots_required == 1) {
+            int slot_idx = bitmap->allocate_one();
+            if (slot_idx != -1) {
+                allocation_base = base + slot_size * slot_idx;
+                slots_in_use.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        return allocation_base;
     }
 
-    return allocation_base;
-}
+    void free(char* ptr, size_t size) {
+        if (ptr == NULL || size == 0) {
+            return;
+        }
 
-// Finally a one that's simple :wiping_sweat:
-void arena_free(Arena* arena, char* ptr, size_t size) {
-    if (arena == NULL || ptr == NULL || size == 0) {
-        return;
+        if (ptr < base || ptr >= base + capacity) {
+            return;
+        }
+
+        size_t start_slot = (ptr - base) / slot_size;
+        size_t slots_to_free = (size + slot_size - 1) / slot_size;
+
+        std::lock_guard<std::mutex> lock(bitmap_mutex);
+
+        for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
+            bitmap->free_slot(i);
+        }
+
+        slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
     }
-
-    if (ptr < arena->base || ptr >= arena->base + arena->capacity) {
-        return;
-    }
-
-    // TODO: Check if this needs to be ceiled, probably yes.
-    // I see why OS always talks about never trusting the user.
-    size_t start_slot = (ptr - arena->base) / arena->slot_size;
-    size_t slots_to_free = (size + arena->slot_size - 1) / arena->slot_size;
-
-    std::lock_guard<std::mutex> lock(arena->bitmap_mutex);
-
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < arena->bitmap->num_slots; ++i) {
-        arena->bitmap->free_slot(i);
-    }
-
-    // Since the mutex guards this area we do not need anything more than relaxed.
-    arena->slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
-}
+};
 
 int main() {
     return 0;
