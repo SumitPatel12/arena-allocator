@@ -22,7 +22,7 @@
    - Speedup comparison (Phase 1 time / Phase 2 time)
 
    How to compile:
-     g++ -std=c++20 -O2 -pthread -o benchmark benchmark.cpp
+     g++ -std=c++20 -O2 -pthread -o benchmark benchmark.cpp arena_allocator.cpp
 
    How to run:
      ./benchmark           # Run with default 4 threads
@@ -31,146 +31,14 @@
      ./benchmark 16        # Run with 16 threads
 */
 
-#include "bitmap.h"
+#include "arena_allocator.h"
 
 #include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <mutex>
-#include <sys/mman.h>
 #include <thread>
 #include <vector>
-
-// Mutex-protected Arena (from arena_allocator.cpp)
-struct Arena {
-    size_t capacity;
-    char* base;
-    size_t slot_size;
-    Bitmap* bitmap;
-    std::mutex bitmap_mutex;
-    std::atomic_int16_t slots_in_use;
-
-    Arena(size_t capacity, size_t page_size) : capacity(capacity), slot_size(page_size), slots_in_use(0) {
-        uint32_t num_slots = (capacity + page_size - 1) / page_size;
-        num_slots = (num_slots < 64) ? 64 : num_slots;
-        if (num_slots % 64 != 0) {
-            num_slots = ((num_slots / 64) + 1) * 64;
-        }
-
-        base = static_cast<char*>(
-            mmap(nullptr, num_slots * slot_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
-        if (base == MAP_FAILED) {
-            perror("mmap failed");
-            throw std::runtime_error("Failed to allocate memory with mmap");
-        }
-
-        bitmap = new Bitmap(num_slots);
-    }
-
-    ~Arena() {
-        delete bitmap;
-        munmap(base, capacity);
-    }
-
-    char* allocate(size_t size) {
-        uint32_t slots_required = (size + slot_size - 1) / slot_size;
-        if (slots_required != 1) {
-            return NULL;
-        }
-
-        std::lock_guard<std::mutex> lock(bitmap_mutex);
-        int slot_idx = bitmap->allocate_one();
-        if (slot_idx == -1) {
-            return NULL;
-        }
-
-        char* ptr = base + slot_size * slot_idx;
-        slots_in_use.fetch_add(1, std::memory_order_relaxed);
-        return ptr;
-    }
-
-    void free(char* ptr, size_t size) {
-        if (ptr < base || ptr >= base + capacity) {
-            return;
-        }
-
-        uint32_t start_slot = (ptr - base) / slot_size;
-        uint32_t slots_to_free = (size + slot_size - 1) / slot_size;
-
-        std::lock_guard<std::mutex> lock(bitmap_mutex);
-        for (uint32_t i = 0; i < slots_to_free; ++i) {
-            bitmap->free_slot(start_slot + i);
-        }
-        slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
-    }
-};
-
-// Lock-free Arena (from arena_allocator.cpp)
-struct ArenaLockFree {
-    size_t capacity;
-    char* base;
-    size_t slot_size;
-    BitmapLockFree* bitmap;
-    std::atomic_int16_t slots_in_use;
-
-    ArenaLockFree(size_t capacity, size_t page_size) : capacity(capacity), slot_size(page_size), slots_in_use(0) {
-        uint32_t num_slots = (capacity + page_size - 1) / page_size;
-        num_slots = (num_slots < 64) ? 64 : num_slots;
-        if (num_slots % 64 != 0) {
-            num_slots = ((num_slots / 64) + 1) * 64;
-        }
-
-        base = static_cast<char*>(
-            mmap(nullptr, num_slots * slot_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
-        if (base == MAP_FAILED) {
-            perror("mmap failed");
-            throw std::runtime_error("Failed to allocate memory with mmap");
-        }
-
-        bitmap = new BitmapLockFree(num_slots);
-    }
-
-    ~ArenaLockFree() {
-        delete bitmap;
-        munmap(base, capacity);
-    }
-
-    char* allocate(size_t size) {
-        uint32_t slots_required = (size + slot_size - 1) / slot_size;
-        if (slots_required != 1) {
-            return NULL;
-        }
-
-        int slot_idx = bitmap->allocate_one();
-        if (slot_idx == -1) {
-            return NULL;
-        }
-
-        char* ptr = base + slot_size * slot_idx;
-        slots_in_use.fetch_add(1, std::memory_order_relaxed);
-        return ptr;
-    }
-
-    void free(char* ptr, size_t size) {
-        if (ptr < base || ptr >= base + capacity) {
-            return;
-        }
-
-        uint32_t start_slot = (ptr - base) / slot_size;
-        uint32_t slots_to_free = (size + slot_size - 1) / slot_size;
-
-        for (uint32_t i = 0; i < slots_to_free; ++i) {
-            bitmap->free_slot(start_slot + i);
-        }
-        slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
-    }
-
-    uint64_t get_cas_retries() const {
-        return bitmap->get_cas_retries();
-    }
-};
 
 // Benchmark configuration
 struct BenchmarkConfig {
