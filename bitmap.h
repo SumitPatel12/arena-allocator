@@ -1,3 +1,6 @@
+#ifndef BITMAP_H
+#define BITMAP_H
+
 // We'll have a bitmap that keeps track of the slot allocation state from the arena allocator.
 // Ok, so from searching around a bit, bitmaps are generally a collection of cache words or just words. Words being 64
 // or 32 bit in size depending on the machine architecture. We'll just consider 64 bit for this implementation since
@@ -12,7 +15,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 // BitMap the track the usage of slots in the arena_allocator.
@@ -33,8 +37,7 @@ struct Bitmap {
 
     explicit Bitmap(uint32_t num_slots) : num_slots(num_slots) {
         if (num_slots % WORD_LENGTH != 0) {
-            perror("number of slots must be a multiple of 64");
-            exit(EXIT_FAILURE);
+            throw std::invalid_argument("number of slots must be a multiple of 64");
         }
 
         // Since each word is 64 bits long we just get the number by dividing slots by 64.
@@ -70,11 +73,15 @@ inline int Bitmap::allocate_one() {
     for (size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
         uint64_t word = words[word_idx];
         if (word != FULLY_ALLOCATED) {
-            // Count trailing zeros, subtract from 63 since we're counting from the back.
-            // For example consider the second bit in the 3rd word.
-            // W0 W1 W2 0100... -> W3a          (Wlen - bit_idx)
-            // Then the index should be 3 * 64 + (63 - 1) = 254 Which is correct, since slot index themsef start at 0.
+            // Count leading zeros from the MSB side, subtract from 63 to get the bit index from the right.
+            // This allocates from the highest free bit position (MSB side).
+            // For example consider a word with bit 62 set (counting from LSB = bit 0):
+            // 0100...0 has 1 leading zero, so bit_idx = 63 - 1 = 62
             int bit_idx = MAX_IDX - std::countl_zero(word);
+            // Validate bit_idx is in valid range
+            if (bit_idx < 0 || bit_idx > 63) {
+                continue;
+            }
             // Since we're allocating the slot, we need to set it to 0.
             words[word_idx] &= ~(1ULL << bit_idx);
             return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
@@ -105,18 +112,24 @@ struct BitmapLockFree {
     std::uint64_t MAX_IDX = 63;
 
     uint32_t num_slots;
-    std::deque<std::atomic<std::uint64_t>> words;
+    size_t num_words;
+    std::atomic<std::uint64_t>* words;
 
     explicit BitmapLockFree(uint32_t num_slots) : num_slots(num_slots) {
         if (num_slots % WORD_LENGTH != 0) {
-            perror("number of slots must be a multiple of 64");
-            exit(EXIT_FAILURE);
+            throw std::invalid_argument("number of slots must be a multiple of 64");
         }
 
-        size_t num_words = num_slots / WORD_LENGTH;
+        num_words = num_slots / WORD_LENGTH;
+        // Use raw array allocation since std::vector doesn't work with non-moveable atomics
+        words = new std::atomic<std::uint64_t>[num_words];
         for (size_t i = 0; i < num_words; ++i) {
-            words.emplace_back(FULLY_FREE);
+            words[i].store(FULLY_FREE, std::memory_order_relaxed);
         }
+    }
+
+    ~BitmapLockFree() {
+        delete[] words;
     }
 
     std::pair<size_t, uint32_t> get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const;
@@ -159,15 +172,19 @@ inline size_t BitmapLockFree::get_slot_index_from_word_and_bit_index(size_t word
 /// - No thread can block others indefinitely (no locks, no waiting)
 inline int BitmapLockFree::allocate_one() {
     // Scan all words looking for one with free bits
-    for (size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+    for (size_t word_idx = 0; word_idx < num_words; ++word_idx) {
         // Load the current word value with acquire semantics to see any prior frees
         uint64_t observed = words[word_idx].load(std::memory_order_acquire);
 
         // CAS retry loop for this word
         while (observed != FULLY_ALLOCATED) {
             // Find the highest free bit (1) in the observed word
-            // countl_zero returns number of leading zeros, subtract from 63 to get bit index
+            // countl_zero returns number of leading zeros, subtract from 63 to get bit index from the right
             int bit_idx = static_cast<int>(MAX_IDX - std::countl_zero(observed));
+            // Validate bit_idx is in valid range
+            if (bit_idx < 0 || bit_idx > 63) {
+                break;
+            }
             uint64_t bit_mask = (1ULL << bit_idx);
 
             // Compute the new word value with the chosen bit cleared (allocated)
@@ -211,3 +228,5 @@ inline int BitmapLockFree::free_slot(uint32_t slot_idx) {
     words[word_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
     return 0;
 }
+
+#endif // BITMAP_H

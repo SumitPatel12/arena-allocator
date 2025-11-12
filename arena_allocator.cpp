@@ -155,6 +155,124 @@ struct Arena {
             bitmap->free_slot(i);
         }
 
+        // If I use a lock free implementation would this work?
+        // Likely yes since even if this is not mutex protected, the operation is still atomic. But I'll need to think
+        // if there is a scenario where there can be inconsistencies in the snapshot in time.
+        slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+    }
+};
+
+// Lock-free arena allocator using BitmapLockFree for thread-safe allocation without mutexes.
+// This implementation uses atomic operations and compare-and-swap for all bitmap operations.
+// Single-slot allocation only (same as Arena for now).
+struct ArenaLockFree {
+    // Capacity of the arena
+    size_t capacity;
+    // Pointer to the base of the arena.
+    char* base;
+    // The frame/slot size.
+    size_t slot_size;
+    // Lock-free bitmap to track slot allocation state.
+    BitmapLockFree* bitmap;
+    // Total number of slots being used at any given point. Needs to be thread safe.
+    std::atomic_int16_t slots_in_use;
+
+    // Lock-free arena constructor - same initialization as Arena but uses BitmapLockFree.
+    // The capacity will be adjusted so that it is an exact multiple of page_size.
+    // Ideally the page_size will be a power of 2 for good memory alignment.
+    // For the bitmap implementation the number of slots in the arena need to be a multiple of 64.
+    ArenaLockFree(size_t capacity, size_t page_size) {
+        // Calculate initial number of slots that would fit
+        size_t num_slots = (capacity + page_size - 1) / page_size;
+
+        // Ensure minimum of 64 slots, or round up to next multiple of 64
+        if (num_slots < 64) {
+            num_slots = 64;
+        } else {
+            // Bit manipulation way of getting to the next multiple of 64.
+            // Neat trick, we add a 63 to get the current atleast to the next multiple of 64 then just logical & with
+            // the compliemnt of 63 meaning we make the number divisible by 64. In this case it sets the las 5 bits to 0
+            // which ensures that the number is divisible by 64.
+            num_slots = (num_slots + 63) & ~63;
+        }
+
+        // Capacity is adjusted to be an exact multiple of page_size and slot count
+        this->capacity = num_slots * page_size;
+        this->slot_size = page_size;
+
+        // For the buffer pool we'll have to read and write the pages, the memory is not backed by a file, and it's
+        // private to our process.
+        void* arena_start = mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+        // TODO: Double check if panicking is the right thing to do.
+        // Not sure if we should panic but it'll do for now.
+        if (arena_start == MAP_FAILED) {
+            perror("mmap failed");
+            exit(EXIT_FAILURE);
+        }
+
+        this->bitmap = new BitmapLockFree(num_slots);
+        this->base = (char*)arena_start;
+        this->slots_in_use.store(0);
+    }
+
+    ~ArenaLockFree() {
+        int unmapped = munmap(base, capacity);
+
+        if (unmapped == -1) {
+            perror("munmap failed");
+            exit(EXIT_FAILURE);
+        }
+
+        delete bitmap;
+    }
+
+    // Lock-free single-slot allocation.
+    // Uses BitmapLockFree::allocate_one() which performs atomic CAS operations.
+    // Currently only supports single-slot allocations (slots_required == 1).
+    char* allocate(size_t size) {
+        if (size == 0) {
+            return NULL;
+        }
+        size_t slots_required = (size + slot_size - 1) / slot_size;
+        char* allocation_base = NULL;
+
+        // No mutex needed - bitmap operations are lock-free with atomic CAS
+        if (slots_required == 1) {
+            int slot_idx = bitmap->allocate_one();
+            if (slot_idx != -1) {
+                allocation_base = base + slot_size * slot_idx;
+                // Atomic increment without mutex - safe because it's atomic
+                slots_in_use.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        return allocation_base;
+    }
+
+    // Lock-free deallocation.
+    // Uses BitmapLockFree::free_slot() which performs atomic fetch_or operations.
+    void free(char* ptr, size_t size) {
+        if (ptr == NULL || size == 0) {
+            return;
+        }
+
+        if (ptr < base || ptr >= base + capacity) {
+            return;
+        }
+
+        size_t start_slot = (ptr - base) / slot_size;
+        size_t slots_to_free = (size + slot_size - 1) / slot_size;
+
+        // No mutex needed - all operations are lock-free
+        for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
+            bitmap->free_slot(i);
+        }
+
+        // TODO: This might not be how we want to do stuff. :sweating:
+        // Atomic decrement - safe without mutex protection.
+        // The count may be slightly inconsistent in the moment if concurrent frees occur,
+        // but will eventually be consistent since each free atomically decrements.
         slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
     }
 };
