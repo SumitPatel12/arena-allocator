@@ -114,8 +114,9 @@ struct BitmapLockFree {
     uint32_t num_slots;
     size_t num_words;
     std::atomic<std::uint64_t>* words;
+    std::atomic<uint64_t> cas_retries; // Counter for CAS retry attempts
 
-    explicit BitmapLockFree(uint32_t num_slots) : num_slots(num_slots) {
+    explicit BitmapLockFree(uint32_t num_slots) : num_slots(num_slots), cas_retries(0) {
         if (num_slots % WORD_LENGTH != 0) {
             throw std::invalid_argument("number of slots must be a multiple of 64");
         }
@@ -136,6 +137,9 @@ struct BitmapLockFree {
     size_t get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const;
     int allocate_one();
     int free_slot(uint32_t slot_idx);
+    uint64_t get_cas_retries() const {
+        return cas_retries.load(std::memory_order_relaxed);
+    }
 };
 
 /// Returns the word and bit index given the slot index.
@@ -205,6 +209,8 @@ inline int BitmapLockFree::allocate_one() {
             }
 
             // CAS failed due to contention or spurious failure
+            // Increment retry counter for benchmarking
+            cas_retries.fetch_add(1, std::memory_order_relaxed);
             // observed now contains the updated word value, loop to try again
             // If another thread allocated our target bit, observed may still have other free bits
             // If another thread allocated all bits, observed == FULLY_ALLOCATED and we exit loop
