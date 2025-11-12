@@ -40,4 +40,36 @@ struct ArenaLockFree {
     }
 };
 
+// Lock-free arena allocator with hint using BitmapLockFreeHint.
+struct ArenaLockFreeHint {
+    size_t capacity;
+    char* base;
+    size_t slot_size;
+    BitmapLockFreeHint* bitmap;
+    std::atomic_int16_t slots_in_use;
+
+    ArenaLockFreeHint(size_t capacity, size_t page_size);
+    ~ArenaLockFreeHint();
+    char* allocate(size_t size);
+    void free(char* ptr, size_t size);
+    uint64_t get_cas_retries() const {
+        return bitmap->get_cas_retries();
+    }
+};
+
+// Arena allocator with BitmapNoHint (mutex-protected, no hint mechanism).
+struct ArenaNoHint {
+    size_t capacity;
+    char* base;
+    size_t slot_size;
+    BitmapNoHint* bitmap;
+    std::mutex bitmap_mutex;
+    std::atomic_int16_t slots_in_use;
+
+    ArenaNoHint(size_t capacity, size_t page_size);
+    ~ArenaNoHint();
+    char* allocate(size_t size);
+    void free(char* ptr, size_t size);
+};
+
 #endif // ARENA_ALLOCATOR_H

@@ -31,6 +31,7 @@ struct Bitmap {
     std::uint64_t FULLY_FREE = UINT64_MAX;
     // I could likely resuse the mask since it's the same value but that wouldn't be very readable.
     std::uint64_t MAX_IDX = 63;
+    std::atomic<size_t> allocation_hint;
 
     uint32_t num_slots;
     std::vector<uint64_t> words;
@@ -44,6 +45,7 @@ struct Bitmap {
         size_t num_words = num_slots / WORD_LENGTH;
         // Initially all of the pages are free.
         words.assign(num_words, FULLY_FREE);
+        allocation_hint.store(0, std::memory_order_relaxed);
     }
 
     std::pair<size_t, uint32_t> get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const;
@@ -70,7 +72,7 @@ inline size_t Bitmap::get_slot_index_from_word_and_bit_index(size_t word_idx, ui
 // first pass.
 /// Allocates one free slot from the bitmap, returns the index of the bitmap if allocation was successful, -1 otherwise.
 inline int Bitmap::allocate_one() {
-    for (size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+    for (size_t word_idx = allocation_hint; word_idx < words.size(); ++word_idx) {
         uint64_t word = words[word_idx];
         if (word != FULLY_ALLOCATED) {
             // Count leading zeros from the MSB side, subtract from 63 to get the bit index from the right.
@@ -84,6 +86,36 @@ inline int Bitmap::allocate_one() {
             }
             // Since we're allocating the slot, we need to set it to 0.
             words[word_idx] &= ~(1ULL << bit_idx);
+            // Just some hints for the next allocation request to start looking from.
+            if (word == FULLY_ALLOCATED) {
+                allocation_hint.store((word_idx + 1) % words.size());
+            } else {
+                allocation_hint.store(word_idx);
+            }
+            return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
+        }
+    }
+
+    for (size_t word_idx = 0; word_idx < allocation_hint; ++word_idx) {
+        uint64_t word = words[word_idx];
+        if (word != FULLY_ALLOCATED) {
+            // Count leading zeros from the MSB side, subtract from 63 to get the bit index from the right.
+            // This allocates from the highest free bit position (MSB side).
+            // For example consider a word with bit 62 set (counting from LSB = bit 0):
+            // 0100...0 has 1 leading zero, so bit_idx = 63 - 1 = 62
+            int bit_idx = MAX_IDX - std::countl_zero(word);
+            // Validate bit_idx is in valid range
+            if (bit_idx < 0 || bit_idx > 63) {
+                continue;
+            }
+            // Since we're allocating the slot, we need to set it to 0.
+            words[word_idx] &= ~(1ULL << bit_idx);
+            // Just some hints for the next allocation request to start looking from.
+            if (word == FULLY_ALLOCATED) {
+                allocation_hint.store((word_idx + 1) % words.size());
+            } else {
+                allocation_hint.store(word_idx);
+            }
             return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
         }
     }
@@ -98,6 +130,9 @@ inline int Bitmap::free_slot(uint32_t slot_idx) {
     size_t word_idx, bit_idx;
     std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
     words[word_idx] |= (1ULL << bit_idx);
+    // Update hint to point to the word where we just freed a slot
+    // This helps allocations find free slots faster
+    allocation_hint.store(word_idx, std::memory_order_relaxed);
     return 0;
 }
 
@@ -232,6 +267,189 @@ inline int BitmapLockFree::free_slot(uint32_t slot_idx) {
     // Release semantics ensure that any writes to the slot happen-before
     // the next thread that allocates it (via acquire in allocate_one_lock_free)
     words[word_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
+    return 0;
+}
+
+// Lock-free bitmap with hint mechanism using thread-local counter
+// 1 means free, 0 means allocated (same convention as BitmapLockFree).
+struct BitmapLockFreeHint {
+    std::uint32_t WORD_SHIFT = 6;
+    std::uint32_t WORD_LENGTH = 64;
+    std::uint32_t WORD_MASK = 63;
+    std::uint64_t FULLY_ALLOCATED = 0;
+    std::uint64_t FULLY_FREE = UINT64_MAX;
+    std::uint64_t MAX_IDX = 63;
+
+    uint32_t num_slots;
+    size_t num_words;
+    std::atomic<std::uint64_t>* words;
+    std::atomic<uint64_t> cas_retries; // Counter for CAS retry attempts
+
+    // Atomic hint counter - each thread increments atomically
+    std::atomic<size_t> allocation_hint;
+
+    explicit BitmapLockFreeHint(uint32_t num_slots) : num_slots(num_slots), cas_retries(0), allocation_hint(0) {
+        if (num_slots % WORD_LENGTH != 0) {
+            throw std::invalid_argument("number of slots must be a multiple of 64");
+        }
+
+        num_words = num_slots / WORD_LENGTH;
+        words = new std::atomic<std::uint64_t>[num_words];
+        for (size_t i = 0; i < num_words; ++i) {
+            words[i].store(FULLY_FREE, std::memory_order_relaxed);
+        }
+    }
+
+    ~BitmapLockFreeHint() {
+        delete[] words;
+    }
+
+    std::pair<size_t, uint32_t> get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const;
+    size_t get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const;
+    int allocate_one();
+    int free_slot(uint32_t slot_idx);
+    uint64_t get_cas_retries() const {
+        return cas_retries.load(std::memory_order_relaxed);
+    }
+};
+
+/// Returns the word and bit index given the slot index.
+inline std::pair<size_t, uint32_t> BitmapLockFreeHint::get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const {
+    return {slot_idx >> WORD_SHIFT, slot_idx & WORD_MASK};
+}
+
+/// Returns the slot_index given the word, and bit index
+inline size_t BitmapLockFreeHint::get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const {
+    return (word_idx << WORD_SHIFT) | bit_idx;
+}
+
+/// Lock-free single-slot allocation with atomic hint for starting position.
+/// The hint counter uses atomic fetch_add to safely increment across threads.
+inline int BitmapLockFreeHint::allocate_one() {
+    // Atomically increment hint and keep it bounded with modulo
+    size_t hint = allocation_hint.fetch_add(1, std::memory_order_relaxed) % num_words;
+    size_t start_idx = hint;
+
+    // Scan from start_idx to end of array
+    for (size_t word_idx = start_idx; word_idx < num_words; ++word_idx) {
+        uint64_t observed = words[word_idx].load(std::memory_order_acquire);
+
+        while (observed != FULLY_ALLOCATED) {
+            int bit_idx = static_cast<int>(MAX_IDX - std::countl_zero(observed));
+            if (bit_idx < 0 || bit_idx > 63) {
+                break;
+            }
+            uint64_t bit_mask = (1ULL << bit_idx);
+            uint64_t new_word = observed & ~bit_mask;
+
+            if (words[word_idx].compare_exchange_weak(observed, new_word, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+                return static_cast<int>(
+                    get_slot_index_from_word_and_bit_index(word_idx, static_cast<uint32_t>(bit_idx)));
+            }
+
+            cas_retries.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Wrap around: scan from beginning to start_idx
+    for (size_t word_idx = 0; word_idx < start_idx; ++word_idx) {
+        uint64_t observed = words[word_idx].load(std::memory_order_acquire);
+
+        while (observed != FULLY_ALLOCATED) {
+            int bit_idx = static_cast<int>(MAX_IDX - std::countl_zero(observed));
+            if (bit_idx < 0 || bit_idx > 63) {
+                break;
+            }
+            uint64_t bit_mask = (1ULL << bit_idx);
+            uint64_t new_word = observed & ~bit_mask;
+
+            if (words[word_idx].compare_exchange_weak(observed, new_word, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+                return static_cast<int>(
+                    get_slot_index_from_word_and_bit_index(word_idx, static_cast<uint32_t>(bit_idx)));
+            }
+
+            cas_retries.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    return -1;
+}
+
+/// Free a previously allocated slot.
+inline int BitmapLockFreeHint::free_slot(uint32_t slot_idx) {
+    size_t word_idx;
+    uint32_t bit_idx;
+    std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
+    words[word_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
+    return 0;
+}
+
+// Bitmap without hint mechanism - always scans from the beginning
+// 1 means free, 0 means allocated (same convention as Bitmap).
+struct BitmapNoHint {
+    std::uint32_t WORD_SHIFT = 6;
+    std::uint32_t WORD_LENGTH = 64;
+    std::uint32_t WORD_MASK = 63;
+    std::uint64_t FULLY_ALLOCATED = 0;
+    std::uint64_t FULLY_FREE = UINT64_MAX;
+    std::uint64_t MAX_IDX = 63;
+
+    uint32_t num_slots;
+    std::vector<uint64_t> words;
+
+    explicit BitmapNoHint(uint32_t num_slots) : num_slots(num_slots) {
+        if (num_slots % WORD_LENGTH != 0) {
+            throw std::invalid_argument("number of slots must be a multiple of 64");
+        }
+
+        size_t num_words = num_slots / WORD_LENGTH;
+        words.assign(num_words, FULLY_FREE);
+    }
+
+    std::pair<size_t, uint32_t> get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const;
+    size_t get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const;
+    int allocate_one();
+    int allocate_many(uint32_t num_slots);
+    int free_slot(uint32_t slot_idx);
+};
+
+/// Returns the word and bit index given the slot index.
+inline std::pair<size_t, uint32_t> BitmapNoHint::get_word_and_bit_index_from_slot_index(uint32_t slot_idx) const {
+    return {slot_idx >> WORD_SHIFT, slot_idx & WORD_MASK};
+}
+
+/// Returns the slot_index given the word, and bit index
+inline size_t BitmapNoHint::get_slot_index_from_word_and_bit_index(size_t word_idx, uint32_t bit_idx) const {
+    return word_idx << WORD_SHIFT | bit_idx;
+}
+
+/// Allocates one free slot from the bitmap, returns the index of the bitmap if allocation was successful, -1 otherwise.
+/// Always scans from the beginning (no hint mechanism).
+inline int BitmapNoHint::allocate_one() {
+    for (size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+        uint64_t word = words[word_idx];
+        if (word != FULLY_ALLOCATED) {
+            int bit_idx = MAX_IDX - std::countl_zero(word);
+            if (bit_idx < 0 || bit_idx > 63) {
+                continue;
+            }
+            words[word_idx] &= ~(1ULL << bit_idx);
+            return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
+        }
+    }
+    return -1;
+}
+
+inline int BitmapNoHint::allocate_many(uint32_t num_slots) {
+    return -1;
+}
+
+inline int BitmapNoHint::free_slot(uint32_t slot_idx) {
+    size_t word_idx, bit_idx;
+    std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
+    words[word_idx] |= (1ULL << bit_idx);
     return 0;
 }
 

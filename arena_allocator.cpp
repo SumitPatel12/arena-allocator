@@ -233,3 +233,141 @@ void ArenaLockFree::free(char* ptr, size_t size) {
     // but will eventually be consistent since each free atomically decrements.
     slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
 }
+
+// ArenaLockFreeHint constructor - uses BitmapLockFreeHint (lock-free with hint)
+ArenaLockFreeHint::ArenaLockFreeHint(size_t capacity, size_t page_size) {
+    size_t num_slots = (capacity + page_size - 1) / page_size;
+    if (num_slots < 64) {
+        num_slots = 64;
+    } else {
+        num_slots = ((num_slots + 63) / 64) * 64;
+    }
+
+    this->capacity = num_slots * page_size;
+    this->slot_size = page_size;
+
+    base = static_cast<char*>(mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (base == MAP_FAILED) {
+        throw std::runtime_error("mmap failed");
+    }
+
+    bitmap = new BitmapLockFreeHint(num_slots);
+    slots_in_use.store(0, std::memory_order_relaxed);
+}
+
+ArenaLockFreeHint::~ArenaLockFreeHint() {
+    if (base != nullptr && base != MAP_FAILED) {
+        munmap(base, capacity);
+    }
+    delete bitmap;
+}
+
+char* ArenaLockFreeHint::allocate(size_t size) {
+    char* allocation_base = NULL;
+
+    if (size == 0) {
+        return allocation_base;
+    }
+
+    size_t slots_required = (size + slot_size - 1) / slot_size;
+
+    if (slots_required == 1) {
+        int slot_idx = bitmap->allocate_one();
+        if (slot_idx != -1) {
+            allocation_base = base + slot_size * slot_idx;
+            slots_in_use.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    return allocation_base;
+}
+
+void ArenaLockFreeHint::free(char* ptr, size_t size) {
+    if (ptr == NULL || size == 0) {
+        return;
+    }
+
+    if (ptr < base || ptr >= base + capacity) {
+        return;
+    }
+
+    size_t start_slot = (ptr - base) / slot_size;
+    size_t slots_to_free = (size + slot_size - 1) / slot_size;
+
+    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
+        bitmap->free_slot(i);
+    }
+
+    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+}
+
+// ArenaNoHint constructor - uses BitmapNoHint (no hint mechanism)
+ArenaNoHint::ArenaNoHint(size_t capacity, size_t page_size) {
+    size_t num_slots = (capacity + page_size - 1) / page_size;
+    if (num_slots < 64) {
+        num_slots = 64;
+    } else {
+        num_slots = ((num_slots + 63) / 64) * 64;
+    }
+
+    this->capacity = num_slots * page_size;
+    this->slot_size = page_size;
+
+    base = static_cast<char*>(mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (base == MAP_FAILED) {
+        throw std::runtime_error("mmap failed");
+    }
+
+    bitmap = new BitmapNoHint(num_slots);
+    slots_in_use.store(0, std::memory_order_relaxed);
+}
+
+ArenaNoHint::~ArenaNoHint() {
+    if (base != nullptr && base != MAP_FAILED) {
+        munmap(base, capacity);
+    }
+    delete bitmap;
+}
+
+char* ArenaNoHint::allocate(size_t size) {
+    char* allocation_base = NULL;
+
+    if (size == 0) {
+        return allocation_base;
+    }
+
+    size_t slots_required = (size + slot_size - 1) / slot_size;
+
+    std::lock_guard<std::mutex> lock(bitmap_mutex);
+
+    if (slots_required == 1) {
+        int slot_idx = bitmap->allocate_one();
+        if (slot_idx != -1) {
+            allocation_base = base + slot_size * slot_idx;
+            slots_in_use.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    return allocation_base;
+}
+
+void ArenaNoHint::free(char* ptr, size_t size) {
+    if (ptr == NULL || size == 0) {
+        return;
+    }
+
+    if (ptr < base || ptr >= base + capacity) {
+        return;
+    }
+
+    size_t start_slot = (ptr - base) / slot_size;
+    size_t slots_to_free = (size + slot_size - 1) / slot_size;
+
+    std::lock_guard<std::mutex> lock(bitmap_mutex);
+
+    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
+        bitmap->free_slot(i);
+    }
+
+    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+}

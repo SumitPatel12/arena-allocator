@@ -1,11 +1,10 @@
 /*
    Arena Allocator Benchmark
 
-   This benchmark compares the performance of mutex-protected Arena vs lock-free ArenaLockFree allocators.
-
-   The benchmark has two phases:
-   - Phase 1: Uses mutex-protected Arena allocator
-   - Phase 2: Uses lock-free ArenaLockFree allocator
+   This benchmark compares the performance of three arena allocator implementations:
+   - Phase 1: Mutex-protected Arena with hint (allocation_hint in Bitmap)
+   - Phase 2: Mutex-protected ArenaNoHint without hint (BitmapNoHint)
+   - Phase 3: Lock-free ArenaLockFree (BitmapLockFree)
 
    Each phase spawns multiple threads that compete to allocate slots until the arena is full.
 
@@ -18,8 +17,8 @@
    Metrics tracked:
    - Time to fill all slots in each phase
    - Number of slots allocated
-   - CAS retry count (Phase 2 only)
-   - Speedup comparison (Phase 1 time / Phase 2 time)
+   - CAS retry count (Phase 3 only)
+   - Performance comparison across all three implementations
 
    How to compile:
      g++ -std=c++20 -O2 -pthread -o benchmark benchmark.cpp arena_allocator.cpp
@@ -64,8 +63,36 @@ void worker_phase1(Arena* arena, size_t slot_size, uint32_t* thread_allocations)
     *thread_allocations = local_count;
 }
 
-// Worker function for Phase 2 (lock-free ArenaLockFree)
-void worker_phase2(ArenaLockFree* arena, size_t slot_size, uint32_t* thread_allocations) {
+// Worker function for Phase 2 (mutex-protected ArenaNoHint)
+void worker_phase2(ArenaNoHint* arena, size_t slot_size, uint32_t* thread_allocations) {
+    uint32_t local_count = 0;
+    while (true) {
+        char* slot = arena->allocate(slot_size);
+        if (slot == NULL) {
+            break; // Arena is full
+        }
+        local_count++;
+        global_allocated_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    *thread_allocations = local_count;
+}
+
+// Worker function for Phase 3 (lock-free ArenaLockFree)
+void worker_phase3(ArenaLockFree* arena, size_t slot_size, uint32_t* thread_allocations) {
+    uint32_t local_count = 0;
+    while (true) {
+        char* slot = arena->allocate(slot_size);
+        if (slot == NULL) {
+            break; // Arena is full
+        }
+        local_count++;
+        global_allocated_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    *thread_allocations = local_count;
+}
+
+// Worker function for Phase 4 (lock-free ArenaLockFreeHint)
+void worker_phase4(ArenaLockFreeHint* arena, size_t slot_size, uint32_t* thread_allocations) {
     uint32_t local_count = 0;
     while (true) {
         char* slot = arena->allocate(slot_size);
@@ -92,8 +119,8 @@ void run_benchmark(const BenchmarkConfig& config) {
     printf("Total Slots: %u\n", total_slots);
     printf("Threads: %u\n\n", config.num_threads);
 
-    // Phase 1: Mutex-Protected Arena
-    printf("Phase 1 (Mutex-Protected):\n");
+    // Phase 1: Mutex-Protected Arena with Hint
+    printf("Phase 1 (Mutex-Protected with Hint):\n");
     global_allocated_count.store(0, std::memory_order_relaxed);
 
     Arena arena1(config.arena_capacity, config.slot_size);
@@ -117,11 +144,11 @@ void run_benchmark(const BenchmarkConfig& config) {
     printf("  Slots allocated: %u\n", global_allocated_count.load(std::memory_order_relaxed));
     printf("\n");
 
-    // Phase 2: Lock-Free Arena
-    printf("Phase 2 (Lock-Free):\n");
+    // Phase 2: Mutex-Protected Arena without Hint
+    printf("Phase 2 (Mutex-Protected without Hint):\n");
     global_allocated_count.store(0, std::memory_order_relaxed);
 
-    ArenaLockFree arena2(config.arena_capacity, config.slot_size);
+    ArenaNoHint arena2(config.arena_capacity, config.slot_size);
     std::vector<std::thread> threads2;
     std::vector<uint32_t> thread_allocations2(config.num_threads, 0);
 
@@ -137,25 +164,111 @@ void run_benchmark(const BenchmarkConfig& config) {
 
     auto end2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2);
-    uint64_t cas_retries = arena2.get_cas_retries();
 
     printf("  Duration: %.3f ms\n", duration2.count() / 1000.0);
+    printf("  Slots allocated: %u\n", global_allocated_count.load(std::memory_order_relaxed));
+    printf("\n");
+
+    // Phase 3: Lock-Free Arena
+    printf("Phase 3 (Lock-Free):\n");
+    global_allocated_count.store(0, std::memory_order_relaxed);
+
+    ArenaLockFree arena3(config.arena_capacity, config.slot_size);
+    std::vector<std::thread> threads3;
+    std::vector<uint32_t> thread_allocations3(config.num_threads, 0);
+
+    auto start3 = std::chrono::high_resolution_clock::now();
+
+    for (uint32_t i = 0; i < config.num_threads; ++i) {
+        threads3.emplace_back(worker_phase3, &arena3, config.slot_size, &thread_allocations3[i]);
+    }
+
+    for (auto& t : threads3) {
+        t.join();
+    }
+
+    auto end3 = std::chrono::high_resolution_clock::now();
+    auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(end3 - start3);
+    uint64_t cas_retries = arena3.get_cas_retries();
+
+    printf("  Duration: %.3f ms\n", duration3.count() / 1000.0);
     printf("  Slots allocated: %u\n", global_allocated_count.load(std::memory_order_relaxed));
     printf("  CAS retries: %llu\n", (unsigned long long)cas_retries);
     printf("\n");
 
+    // Phase 4: Lock-Free Arena with Hint
+    printf("Phase 4 (Lock-Free with Hint):\n");
+    global_allocated_count.store(0, std::memory_order_relaxed);
+
+    ArenaLockFreeHint arena4(config.arena_capacity, config.slot_size);
+    std::vector<std::thread> threads4;
+    std::vector<uint32_t> thread_allocations4(config.num_threads, 0);
+
+    auto start4 = std::chrono::high_resolution_clock::now();
+
+    for (uint32_t i = 0; i < config.num_threads; ++i) {
+        threads4.emplace_back(worker_phase4, &arena4, config.slot_size, &thread_allocations4[i]);
+    }
+
+    for (auto& t : threads4) {
+        t.join();
+    }
+
+    auto end4 = std::chrono::high_resolution_clock::now();
+    auto duration4 = std::chrono::duration_cast<std::chrono::microseconds>(end4 - start4);
+    uint64_t cas_retries_hint = arena4.get_cas_retries();
+
+    printf("  Duration: %.3f ms\n", duration4.count() / 1000.0);
+    printf("  Slots allocated: %u\n", global_allocated_count.load(std::memory_order_relaxed));
+    printf("  CAS retries: %llu\n", (unsigned long long)cas_retries_hint);
+    printf("\n");
+
     // Comparison
-    printf("Comparison:\n");
+    printf("=== Performance Comparison ===\n");
     double phase1_ms = duration1.count() / 1000.0;
     double phase2_ms = duration2.count() / 1000.0;
+    double phase3_ms = duration3.count() / 1000.0;
+    double phase4_ms = duration4.count() / 1000.0;
 
-    if (phase2_ms > 0) {
-        double speedup = phase1_ms / phase2_ms;
-        printf("  Lock-free speedup: %.3fx\n", speedup);
-        if (speedup < 1.0) {
-            printf("  (Lock-free was %.3fx slower)\n", 1.0 / speedup);
-        }
+    // Find the best performer
+    double best_time = phase1_ms;
+    const char* best_name = "Mutex with Hint";
+    int best_phase = 1;
+
+    if (phase2_ms < best_time) {
+        best_time = phase2_ms;
+        best_name = "Mutex without Hint";
+        best_phase = 2;
     }
+    if (phase3_ms < best_time) {
+        best_time = phase3_ms;
+        best_name = "Lock-Free without Hint";
+        best_phase = 3;
+    }
+    if (phase4_ms < best_time) {
+        best_time = phase4_ms;
+        best_name = "Lock-Free with Hint";
+        best_phase = 4;
+    }
+
+    printf("Best Performer: %s (%.3f ms)\n\n", best_name, best_time);
+
+    printf("Relative Performance (lower is better):\n");
+    printf("  Phase 1 (Mutex with Hint):         %.3f ms (%.2fx vs best)\n", phase1_ms, phase1_ms / best_time);
+    printf("  Phase 2 (Mutex without Hint):      %.3f ms (%.2fx vs best)\n", phase2_ms, phase2_ms / best_time);
+    printf("  Phase 3 (Lock-Free without Hint):  %.3f ms (%.2fx vs best, %llu CAS retries)\n", phase3_ms,
+           phase3_ms / best_time, (unsigned long long)cas_retries);
+    printf("  Phase 4 (Lock-Free with Hint):     %.3f ms (%.2fx vs best, %llu CAS retries)\n", phase4_ms,
+           phase4_ms / best_time, (unsigned long long)cas_retries_hint);
+
+    printf("\nDirect Comparisons:\n");
+    printf("  Mutex: Hint vs No-Hint: %.2fx %s\n", phase2_ms / phase1_ms,
+           phase1_ms < phase2_ms ? "faster with hint" : "slower with hint");
+    printf("  Lock-Free: Hint vs No-Hint: %.2fx %s (CAS retries: %llu vs %llu)\n", phase3_ms / phase4_ms,
+           phase4_ms < phase3_ms ? "faster with hint" : "slower with hint", (unsigned long long)cas_retries_hint,
+           (unsigned long long)cas_retries);
+    printf("  Best Mutex vs Best Lock-Free: %.2fx %s\n", phase4_ms / phase1_ms,
+           phase1_ms < phase4_ms ? "faster with mutex" : "slower with mutex");
 
     printf("\n");
 }
