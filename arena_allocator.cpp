@@ -132,6 +132,88 @@ void Arena::free(char* ptr, size_t size) {
     slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
 }
 
+// ArenaSpinLock constructor - same as Arena but uses spin-lock
+ArenaSpinLock::ArenaSpinLock(size_t capacity, size_t page_size) {
+    size_t num_slots = (capacity + page_size - 1) / page_size;
+
+    if (num_slots < 64) {
+        num_slots = 64;
+    } else {
+        num_slots = (num_slots + 63) & ~63;
+    }
+
+    this->capacity = num_slots * page_size;
+    this->slot_size = page_size;
+    this->bitmap_spinlock.clear(std::memory_order_release);
+
+    void* arena_start = mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+    if (arena_start == MAP_FAILED) {
+        perror("mmap failed");
+        exit(EXIT_FAILURE);
+    }
+
+    this->bitmap = new Bitmap(num_slots);
+    this->base = (char*)arena_start;
+    this->slots_in_use.store(0);
+}
+
+ArenaSpinLock::~ArenaSpinLock() {
+    int unmapped = munmap(base, capacity);
+
+    if (unmapped == -1) {
+        perror("munmap failed");
+        exit(EXIT_FAILURE);
+    }
+
+    delete bitmap;
+}
+
+char* ArenaSpinLock::allocate(size_t size) {
+    if (size == 0) {
+        return NULL;
+    }
+    size_t slots_required = (size + slot_size - 1) / slot_size;
+    char* allocation_base = NULL;
+
+    if (slots_required == 1) {
+        while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
+            // Spin-wait
+        }
+        int slot_idx = bitmap->allocate_one();
+        if (slot_idx != -1) {
+            allocation_base = base + slot_size * slot_idx;
+            slots_in_use.fetch_add(1, std::memory_order_relaxed);
+        }
+        bitmap_spinlock.clear(std::memory_order_release);
+    }
+
+    return allocation_base;
+}
+
+void ArenaSpinLock::free(char* ptr, size_t size) {
+    if (ptr == NULL || size == 0) {
+        return;
+    }
+
+    if (ptr < base || ptr >= base + capacity) {
+        return;
+    }
+
+    size_t start_slot = (ptr - base) / slot_size;
+    size_t slots_to_free = (size + slot_size - 1) / slot_size;
+
+    while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
+        // Spin-wait
+    }
+    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
+        bitmap->free_slot(i);
+    }
+    bitmap_spinlock.clear(std::memory_order_release);
+
+    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+}
+
 // Lock-free arena allocator using BitmapLockFree for thread-safe allocation without mutexes.
 // This implementation uses atomic operations and compare-and-swap for all bitmap operations.
 // Single-slot allocation only (same as Arena for now).
@@ -368,6 +450,82 @@ void ArenaNoHint::free(char* ptr, size_t size) {
     for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
         bitmap->free_slot(i);
     }
+
+    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+}
+
+// ArenaNoHintSpinLock constructor - uses BitmapNoHint with spin-lock
+ArenaNoHintSpinLock::ArenaNoHintSpinLock(size_t capacity, size_t page_size) {
+    size_t num_slots = (capacity + page_size - 1) / page_size;
+    if (num_slots < 64) {
+        num_slots = 64;
+    } else {
+        num_slots = ((num_slots + 63) / 64) * 64;
+    }
+
+    this->capacity = num_slots * page_size;
+    this->slot_size = page_size;
+    this->bitmap_spinlock.clear(std::memory_order_release);
+
+    base = static_cast<char*>(mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (base == MAP_FAILED) {
+        throw std::runtime_error("mmap failed");
+    }
+
+    bitmap = new BitmapNoHint(num_slots);
+    slots_in_use.store(0, std::memory_order_relaxed);
+}
+
+ArenaNoHintSpinLock::~ArenaNoHintSpinLock() {
+    if (base != nullptr && base != MAP_FAILED) {
+        munmap(base, capacity);
+    }
+    delete bitmap;
+}
+
+char* ArenaNoHintSpinLock::allocate(size_t size) {
+    char* allocation_base = NULL;
+
+    if (size == 0) {
+        return allocation_base;
+    }
+
+    size_t slots_required = (size + slot_size - 1) / slot_size;
+
+    if (slots_required == 1) {
+        while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
+            // Spin-wait
+        }
+        int slot_idx = bitmap->allocate_one();
+        if (slot_idx != -1) {
+            allocation_base = base + slot_size * slot_idx;
+            slots_in_use.fetch_add(1, std::memory_order_relaxed);
+        }
+        bitmap_spinlock.clear(std::memory_order_release);
+    }
+
+    return allocation_base;
+}
+
+void ArenaNoHintSpinLock::free(char* ptr, size_t size) {
+    if (ptr == NULL || size == 0) {
+        return;
+    }
+
+    if (ptr < base || ptr >= base + capacity) {
+        return;
+    }
+
+    size_t start_slot = (ptr - base) / slot_size;
+    size_t slots_to_free = (size + slot_size - 1) / slot_size;
+
+    while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
+        // Spin-wait
+    }
+    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
+        bitmap->free_slot(i);
+    }
+    bitmap_spinlock.clear(std::memory_order_release);
 
     slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
 }

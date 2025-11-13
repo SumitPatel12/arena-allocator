@@ -1,0 +1,53 @@
+=== Arena Allocator Benchmark ===
+Arena Capacity: 200 MB
+Slot Size: 4 KB
+Total Slots: 51200
+Threads: 4
+Iterations per phase: 100
+
+Phase 1 (Mutex with Hint): Running... Done
+  Avg: 1.432 ms, Min: 1.123 ms, Max: 2.947 ms
+
+Phase 1b (Spin-Lock with Hint): Running... Done
+  Avg: 14.703 ms, Min: 12.119 ms, Max: 15.385 ms
+
+Phase 2 (Mutex without Hint): Running... Done
+  Avg: 16.705 ms, Min: 15.611 ms, Max: 17.666 ms
+
+Phase 2b (Spin-Lock without Hint): Running... Done
+  Avg: 15.509 ms, Min: 15.345 ms, Max: 15.718 ms
+
+Phase 3 (Lock-Free without Hint): Running... Done
+  Avg: 3.763 ms, Min: 3.714 ms, Max: 3.879 ms, CAS Retries: 29346
+
+Phase 4 (Lock-Free with Hint): Running... Done
+  Avg: 2.496 ms, Min: 2.296 ms, Max: 2.567 ms, CAS Retries: 0
+
+=== Performance Summary Table (Average Times) ===
+
+┌────────┬─────────────────────────────────┬──────────────┬──────────────┬──────────────┐
+│ Phase  │ Implementation                  │ Avg (ms)     │ vs Best      │ CAS Retries  │
+├────────┼─────────────────────────────────┼──────────────┼──────────────┼──────────────┤
+│   1    │ Mutex with Hint                 │     1.432    │        1.00x │            - │
+│   1b   │ Spin-Lock with Hint             │    14.703    │       10.27x │            - │
+│   2    │ Mutex without Hint              │    16.705    │       11.66x │            - │
+│   2b   │ Spin-Lock without Hint          │    15.509    │       10.83x │            - │
+│   3    │ Lock-Free without Hint          │     3.763    │        2.63x │        29346 │
+│   4    │ Lock-Free with Hint             │     2.496    │        1.74x │            0 │
+└────────┴─────────────────────────────────┴──────────────┴──────────────┴──────────────┘
+
+=== Min/Max Times ===
+Phase 1 (Mutex with Hint):         Min: 1.123 ms, Max: 2.947 ms
+Phase 1b (Spin-Lock with Hint):    Min: 12.119 ms, Max: 15.385 ms
+Phase 2 (Mutex without Hint):      Min: 15.611 ms, Max: 17.666 ms
+Phase 2b (Spin-Lock without Hint): Min: 15.345 ms, Max: 15.718 ms
+Phase 3 (Lock-Free without Hint):  Min: 3.714 ms, Max: 3.879 ms
+Phase 4 (Lock-Free with Hint):     Min: 2.296 ms, Max: 2.567 ms
+
+=== Direct Comparisons (Average Times) ===
+Mutex vs Spin-Lock (with Hint):     10.27x faster with mutex
+Mutex vs Spin-Lock (without Hint):  0.93x faster with spin-lock
+Hint vs No-Hint (Mutex):             11.66x faster with hint
+Hint vs No-Hint (Spin-Lock):         1.05x faster with hint
+Hint vs No-Hint (Lock-Free):         1.51x faster with hint (CAS: 0 vs 29346)
+

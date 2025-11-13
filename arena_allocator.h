@@ -23,6 +23,21 @@ struct Arena {
     void free(char* ptr, size_t size);
 };
 
+// Spin-lock protected arena with hint mechanism.
+struct ArenaSpinLock {
+    size_t capacity;
+    char* base;
+    size_t slot_size;
+    Bitmap* bitmap;
+    std::atomic_flag bitmap_spinlock = ATOMIC_FLAG_INIT;
+    std::atomic_int16_t slots_in_use;
+
+    ArenaSpinLock(size_t capacity, size_t page_size);
+    ~ArenaSpinLock();
+    char* allocate(size_t size);
+    void free(char* ptr, size_t size);
+};
+
 // Lock-free arena allocator using BitmapLockFree for thread-safe allocation without mutexes.
 struct ArenaLockFree {
     size_t capacity;
@@ -68,6 +83,21 @@ struct ArenaNoHint {
 
     ArenaNoHint(size_t capacity, size_t page_size);
     ~ArenaNoHint();
+    char* allocate(size_t size);
+    void free(char* ptr, size_t size);
+};
+
+// Spin-lock protected arena without hint mechanism.
+struct ArenaNoHintSpinLock {
+    size_t capacity;
+    char* base;
+    size_t slot_size;
+    BitmapNoHint* bitmap;
+    std::atomic_flag bitmap_spinlock = ATOMIC_FLAG_INIT;
+    std::atomic_int16_t slots_in_use;
+
+    ArenaNoHintSpinLock(size_t capacity, size_t page_size);
+    ~ArenaNoHintSpinLock();
     char* allocate(size_t size);
     void free(char* ptr, size_t size);
 };

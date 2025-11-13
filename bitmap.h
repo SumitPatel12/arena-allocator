@@ -282,6 +282,7 @@ struct BitmapLockFreeHint {
 
     uint32_t num_slots;
     size_t num_words;
+    bool num_words_is_pow2;
     std::atomic<std::uint64_t>* words;
     std::atomic<uint64_t> cas_retries; // Counter for CAS retry attempts
 
@@ -294,6 +295,7 @@ struct BitmapLockFreeHint {
         }
 
         num_words = num_slots / WORD_LENGTH;
+        num_words_is_pow2 = (num_words & (num_words - 1)) == 0;
         words = new std::atomic<std::uint64_t>[num_words];
         for (size_t i = 0; i < num_words; ++i) {
             words[i].store(FULLY_FREE, std::memory_order_relaxed);
@@ -326,8 +328,9 @@ inline size_t BitmapLockFreeHint::get_slot_index_from_word_and_bit_index(size_t 
 /// Lock-free single-slot allocation with atomic hint for starting position.
 /// The hint counter uses atomic fetch_add to safely increment across threads.
 inline int BitmapLockFreeHint::allocate_one() {
-    // Atomically increment hint and keep it bounded with modulo
-    size_t hint = allocation_hint.fetch_add(1, std::memory_order_relaxed) % num_words;
+    // Atomically increment hint and keep it bounded with modulo or bitmask
+    size_t old = allocation_hint.fetch_add(1, std::memory_order_relaxed);
+    size_t hint = num_words_is_pow2 ? (old & (num_words - 1)) : (old % num_words);
     size_t start_idx = hint;
 
     // Scan from start_idx to end of array
