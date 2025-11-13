@@ -32,6 +32,9 @@
 */
 
 #include "arena_allocator.h"
+#include <limits>
+#include <thread>
+#include <stdexcept>
 
 // TODO: Understand the impact and significance of alignment.
 // Well be going the route of mmap for this one: https://stackoverflow.com/questions/45972/mmap-vs-reading-blocks
@@ -46,16 +49,12 @@ Arena::Arena(size_t capacity, size_t page_size) {
     // Calculate initial number of slots that would fit
     size_t num_slots = (capacity + page_size - 1) / page_size;
 
-    // Ensure minimum of 64 slots, or round up to next multiple of 64
-    if (num_slots < 64) {
-        num_slots = 64;
-    } else {
-        // Bit manipulation way of getting to the next multiple of 64.
-        // Neat trick, we add a 63 to get the current atleast to the next multiple of 64 then just logical & with
-        // the compliemnt of 63 meaning we make the number divisible by 64. In this case it sets the las 5 bits to 0
-        // which ensures that the number is divisible by 64.
-        num_slots = (num_slots + 63) & ~63;
+    // Ensure minimum of 64 slots; round up to next multiple of 64
+    if (num_slots < Bitmap::WORD_LENGTH) {
+        num_slots = Bitmap::WORD_LENGTH;
     }
+    // Round up to next multiple of 64 without magic numbers
+    num_slots = ((num_slots + Bitmap::WORD_LENGTH - 1) / Bitmap::WORD_LENGTH) * Bitmap::WORD_LENGTH;
 
     // Capacity is adjusted to be an exact multiple of page_size and slot count
     this->capacity = num_slots * page_size;
@@ -65,11 +64,8 @@ Arena::Arena(size_t capacity, size_t page_size) {
     // private to our process.
     void* arena_start = mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
-    // TODO: Double check if panicking is the right thing to do.
-    // Not sure if we should panic but it'll do for now.
     if (arena_start == MAP_FAILED) {
-        perror("mmap failed");
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("mmap failed");
     }
 
     this->bitmap = new Bitmap(num_slots);
@@ -81,8 +77,7 @@ Arena::~Arena() {
     int unmapped = munmap(base, capacity);
 
     if (unmapped == -1) {
-        perror("munmap failed");
-        exit(EXIT_FAILURE);
+        std::perror("munmap failed");
     }
 
     delete bitmap;
@@ -92,6 +87,7 @@ char* Arena::allocate(size_t size) {
     if (size == 0) {
         return NULL;
     }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
     size_t slots_required = (size + slot_size - 1) / slot_size;
     char* allocation_base = NULL;
 
@@ -117,30 +113,44 @@ void Arena::free(char* ptr, size_t size) {
         return;
     }
 
-    size_t start_slot = (ptr - base) / slot_size;
+    // Alignment check
+    ptrdiff_t offset = ptr - base;
+    if (static_cast<size_t>(offset) % slot_size != 0) {
+        return; // not aligned to slot
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t start_slot = static_cast<size_t>(offset) / slot_size;
     size_t slots_to_free = (size + slot_size - 1) / slot_size;
+    if (slots_to_free != 1) {
+        return; // single-slot only
+    }
 
     std::lock_guard<std::mutex> lock(bitmap_mutex);
 
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
-        bitmap->free_slot(i);
+    if (start_slot >= bitmap->num_slots) {
+        return;
     }
+    auto [word_idx, bit_idx] = bitmap->get_word_and_bit_index_from_slot_index(static_cast<uint32_t>(start_slot));
+    // If bit is 1, slot is already free -> double free
+    if (bitmap->words[word_idx] & (1ULL << bit_idx)) {
+        return;
+    }
+    bitmap->free_slot(static_cast<uint32_t>(start_slot));
 
     // If I use a lock free implementation would this work?
     // Likely yes since even if this is not mutex protected, the operation is still atomic. But I'll need to think
     // if there is a scenario where there can be inconsistencies in the snapshot in time.
-    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+    slots_in_use.fetch_sub(1, std::memory_order_relaxed);
 }
 
 // ArenaSpinLock constructor - same as Arena but uses spin-lock
 ArenaSpinLock::ArenaSpinLock(size_t capacity, size_t page_size) {
     size_t num_slots = (capacity + page_size - 1) / page_size;
 
-    if (num_slots < 64) {
-        num_slots = 64;
-    } else {
-        num_slots = (num_slots + 63) & ~63;
+    if (num_slots < Bitmap::WORD_LENGTH) {
+        num_slots = Bitmap::WORD_LENGTH;
     }
+    num_slots = ((num_slots + Bitmap::WORD_LENGTH - 1) / Bitmap::WORD_LENGTH) * Bitmap::WORD_LENGTH;
 
     this->capacity = num_slots * page_size;
     this->slot_size = page_size;
@@ -149,8 +159,7 @@ ArenaSpinLock::ArenaSpinLock(size_t capacity, size_t page_size) {
     void* arena_start = mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
     if (arena_start == MAP_FAILED) {
-        perror("mmap failed");
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("mmap failed");
     }
 
     this->bitmap = new Bitmap(num_slots);
@@ -162,8 +171,7 @@ ArenaSpinLock::~ArenaSpinLock() {
     int unmapped = munmap(base, capacity);
 
     if (unmapped == -1) {
-        perror("munmap failed");
-        exit(EXIT_FAILURE);
+        std::perror("munmap failed");
     }
 
     delete bitmap;
@@ -173,12 +181,13 @@ char* ArenaSpinLock::allocate(size_t size) {
     if (size == 0) {
         return NULL;
     }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
     size_t slots_required = (size + slot_size - 1) / slot_size;
     char* allocation_base = NULL;
 
     if (slots_required == 1) {
         while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
-            // Spin-wait
+            std::this_thread::yield();
         }
         int slot_idx = bitmap->allocate_one();
         if (slot_idx != -1) {
@@ -200,18 +209,32 @@ void ArenaSpinLock::free(char* ptr, size_t size) {
         return;
     }
 
-    size_t start_slot = (ptr - base) / slot_size;
+    ptrdiff_t offset = ptr - base;
+    if (static_cast<size_t>(offset) % slot_size != 0) {
+        return;
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t start_slot = static_cast<size_t>(offset) / slot_size;
     size_t slots_to_free = (size + slot_size - 1) / slot_size;
+    if (slots_to_free != 1) {
+        return;
+    }
 
     while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
-        // Spin-wait
+        std::this_thread::yield();
     }
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
-        bitmap->free_slot(i);
+    if (start_slot < bitmap->num_slots) {
+        auto [word_idx, bit_idx] = bitmap->get_word_and_bit_index_from_slot_index(static_cast<uint32_t>(start_slot));
+        if ((bitmap->words[word_idx] & (1ULL << bit_idx)) == 0) {
+            // bit 0 -> allocated, safe to free
+            bitmap->free_slot(static_cast<uint32_t>(start_slot));
+            slots_in_use.fetch_sub(1, std::memory_order_relaxed);
+        }
+        // else double-free detected; ignore
     }
     bitmap_spinlock.clear(std::memory_order_release);
 
-    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+    // decrement already done conditionally above
 }
 
 // Lock-free arena allocator using BitmapLockFree for thread-safe allocation without mutexes.
@@ -225,16 +248,10 @@ ArenaLockFree::ArenaLockFree(size_t capacity, size_t page_size) {
     // Calculate initial number of slots that would fit
     size_t num_slots = (capacity + page_size - 1) / page_size;
 
-    // Ensure minimum of 64 slots, or round up to next multiple of 64
-    if (num_slots < 64) {
-        num_slots = 64;
-    } else {
-        // Bit manipulation way of getting to the next multiple of 64.
-        // Neat trick, we add a 63 to get the current atleast to the next multiple of 64 then just logical & with
-        // the compliemnt of 63 meaning we make the number divisible by 64. In this case it sets the las 5 bits to 0
-        // which ensures that the number is divisible by 64.
-        num_slots = (num_slots + 63) & ~63;
+    if (num_slots < BitmapLockFree::WORD_LENGTH) {
+        num_slots = BitmapLockFree::WORD_LENGTH;
     }
+    num_slots = ((num_slots + BitmapLockFree::WORD_LENGTH - 1) / BitmapLockFree::WORD_LENGTH) * BitmapLockFree::WORD_LENGTH;
 
     // Capacity is adjusted to be an exact multiple of page_size and slot count
     this->capacity = num_slots * page_size;
@@ -244,11 +261,8 @@ ArenaLockFree::ArenaLockFree(size_t capacity, size_t page_size) {
     // private to our process.
     void* arena_start = mmap(NULL, this->capacity, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
-    // TODO: Double check if panicking is the right thing to do.
-    // Not sure if we should panic but it'll do for now.
     if (arena_start == MAP_FAILED) {
-        perror("mmap failed");
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("mmap failed");
     }
 
     this->bitmap = new BitmapLockFree(num_slots);
@@ -260,8 +274,7 @@ ArenaLockFree::~ArenaLockFree() {
     int unmapped = munmap(base, capacity);
 
     if (unmapped == -1) {
-        perror("munmap failed");
-        exit(EXIT_FAILURE);
+        std::perror("munmap failed");
     }
 
     delete bitmap;
@@ -271,11 +284,13 @@ ArenaLockFree::~ArenaLockFree() {
 // Uses BitmapLockFree::allocate_one() which performs atomic CAS operations.
 // Currently only supports single-slot allocations (slots_required == 1).
 char* ArenaLockFree::allocate(size_t size) {
-    if (size == 0) {
-        return NULL;
-    }
-    size_t slots_required = (size + slot_size - 1) / slot_size;
     char* allocation_base = NULL;
+
+    if (size == 0) {
+        return allocation_base;
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t slots_required = (size + slot_size - 1) / slot_size;
 
     // No mutex needed - bitmap operations are lock-free with atomic CAS
     if (slots_required == 1) {
@@ -301,29 +316,38 @@ void ArenaLockFree::free(char* ptr, size_t size) {
         return;
     }
 
-    size_t start_slot = (ptr - base) / slot_size;
+    ptrdiff_t offset = ptr - base;
+    if (static_cast<size_t>(offset) % slot_size != 0) {
+        return;
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t start_slot = static_cast<size_t>(offset) / slot_size;
     size_t slots_to_free = (size + slot_size - 1) / slot_size;
-
-    // No mutex needed - all operations are lock-free
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
-        bitmap->free_slot(i);
+    if (slots_to_free != 1) {
+        return;
     }
 
-    // TODO: This might not be how we want to do stuff. :sweating:
-    // Atomic decrement - safe without mutex protection.
-    // The count may be slightly inconsistent in the moment if concurrent frees occur,
-    // but will eventually be consistent since each free atomically decrements.
-    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+    // No mutex needed - all operations are lock-free
+    if (start_slot < bitmap->num_slots) {
+        int rc = bitmap->free_slot(static_cast<uint32_t>(start_slot));
+        if (rc == 0) {
+            slots_in_use.fetch_sub(1, std::memory_order_relaxed);
+        } else {
+            // rc == 1 double-free; rc == -1 OOB -> ignore
+        }
+    }
+
+    // decrement done conditionally above
 }
 
 // ArenaLockFreeHint constructor - uses BitmapLockFreeHint (lock-free with hint)
 ArenaLockFreeHint::ArenaLockFreeHint(size_t capacity, size_t page_size) {
     size_t num_slots = (capacity + page_size - 1) / page_size;
-    if (num_slots < 64) {
-        num_slots = 64;
-    } else {
-        num_slots = ((num_slots + 63) / 64) * 64;
+
+    if (num_slots < BitmapLockFreeHint::WORD_LENGTH) {
+        num_slots = BitmapLockFreeHint::WORD_LENGTH;
     }
+    num_slots = ((num_slots + BitmapLockFreeHint::WORD_LENGTH - 1) / BitmapLockFreeHint::WORD_LENGTH) * BitmapLockFreeHint::WORD_LENGTH;
 
     this->capacity = num_slots * page_size;
     this->slot_size = page_size;
@@ -338,9 +362,12 @@ ArenaLockFreeHint::ArenaLockFreeHint(size_t capacity, size_t page_size) {
 }
 
 ArenaLockFreeHint::~ArenaLockFreeHint() {
-    if (base != nullptr && base != MAP_FAILED) {
-        munmap(base, capacity);
+    int unmapped = munmap(base, capacity);
+
+    if (unmapped == -1) {
+        std::perror("munmap failed");
     }
+
     delete bitmap;
 }
 
@@ -350,7 +377,7 @@ char* ArenaLockFreeHint::allocate(size_t size) {
     if (size == 0) {
         return allocation_base;
     }
-
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
     size_t slots_required = (size + slot_size - 1) / slot_size;
 
     if (slots_required == 1) {
@@ -373,24 +400,33 @@ void ArenaLockFreeHint::free(char* ptr, size_t size) {
         return;
     }
 
-    size_t start_slot = (ptr - base) / slot_size;
+    ptrdiff_t offset = ptr - base;
+    if (static_cast<size_t>(offset) % slot_size != 0) {
+        return;
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t start_slot = static_cast<size_t>(offset) / slot_size;
     size_t slots_to_free = (size + slot_size - 1) / slot_size;
-
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
-        bitmap->free_slot(i);
+    if (slots_to_free != 1) {
+        return;
     }
 
-    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+    if (start_slot < bitmap->num_slots) {
+        int rc = bitmap->free_slot(static_cast<uint32_t>(start_slot));
+        if (rc == 0) {
+            slots_in_use.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
 }
 
 // ArenaNoHint constructor - uses BitmapNoHint (no hint mechanism)
 ArenaNoHint::ArenaNoHint(size_t capacity, size_t page_size) {
     size_t num_slots = (capacity + page_size - 1) / page_size;
-    if (num_slots < 64) {
-        num_slots = 64;
-    } else {
-        num_slots = ((num_slots + 63) / 64) * 64;
+
+    if (num_slots < BitmapNoHint::WORD_LENGTH) {
+        num_slots = BitmapNoHint::WORD_LENGTH;
     }
+    num_slots = ((num_slots + BitmapNoHint::WORD_LENGTH - 1) / BitmapNoHint::WORD_LENGTH) * BitmapNoHint::WORD_LENGTH;
 
     this->capacity = num_slots * page_size;
     this->slot_size = page_size;
@@ -405,9 +441,12 @@ ArenaNoHint::ArenaNoHint(size_t capacity, size_t page_size) {
 }
 
 ArenaNoHint::~ArenaNoHint() {
-    if (base != nullptr && base != MAP_FAILED) {
-        munmap(base, capacity);
+    int unmapped = munmap(base, capacity);
+
+    if (unmapped == -1) {
+        std::perror("munmap failed");
     }
+
     delete bitmap;
 }
 
@@ -417,7 +456,7 @@ char* ArenaNoHint::allocate(size_t size) {
     if (size == 0) {
         return allocation_base;
     }
-
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
     size_t slots_required = (size + slot_size - 1) / slot_size;
 
     std::lock_guard<std::mutex> lock(bitmap_mutex);
@@ -442,26 +481,39 @@ void ArenaNoHint::free(char* ptr, size_t size) {
         return;
     }
 
-    size_t start_slot = (ptr - base) / slot_size;
+    ptrdiff_t offset = ptr - base;
+    if (static_cast<size_t>(offset) % slot_size != 0) {
+        return;
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t start_slot = static_cast<size_t>(offset) / slot_size;
     size_t slots_to_free = (size + slot_size - 1) / slot_size;
+    if (slots_to_free != 1) {
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(bitmap_mutex);
 
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
-        bitmap->free_slot(i);
+    if (start_slot >= bitmap->num_slots) {
+        return;
     }
+    auto [word_idx, bit_idx] = bitmap->get_word_and_bit_index_from_slot_index(static_cast<uint32_t>(start_slot));
+    if (bitmap->words[word_idx] & (1ULL << bit_idx)) {
+        return;
+    }
+    bitmap->free_slot(static_cast<uint32_t>(start_slot));
 
-    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
+    slots_in_use.fetch_sub(1, std::memory_order_relaxed);
 }
 
 // ArenaNoHintSpinLock constructor - uses BitmapNoHint with spin-lock
 ArenaNoHintSpinLock::ArenaNoHintSpinLock(size_t capacity, size_t page_size) {
     size_t num_slots = (capacity + page_size - 1) / page_size;
-    if (num_slots < 64) {
-        num_slots = 64;
-    } else {
-        num_slots = ((num_slots + 63) / 64) * 64;
+
+    if (num_slots < BitmapNoHint::WORD_LENGTH) {
+        num_slots = BitmapNoHint::WORD_LENGTH;
     }
+    num_slots = ((num_slots + BitmapNoHint::WORD_LENGTH - 1) / BitmapNoHint::WORD_LENGTH) * BitmapNoHint::WORD_LENGTH;
 
     this->capacity = num_slots * page_size;
     this->slot_size = page_size;
@@ -477,9 +529,12 @@ ArenaNoHintSpinLock::ArenaNoHintSpinLock(size_t capacity, size_t page_size) {
 }
 
 ArenaNoHintSpinLock::~ArenaNoHintSpinLock() {
-    if (base != nullptr && base != MAP_FAILED) {
-        munmap(base, capacity);
+    int unmapped = munmap(base, capacity);
+
+    if (unmapped == -1) {
+        std::perror("munmap failed");
     }
+
     delete bitmap;
 }
 
@@ -489,12 +544,12 @@ char* ArenaNoHintSpinLock::allocate(size_t size) {
     if (size == 0) {
         return allocation_base;
     }
-
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
     size_t slots_required = (size + slot_size - 1) / slot_size;
 
     if (slots_required == 1) {
         while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
-            // Spin-wait
+            std::this_thread::yield();
         }
         int slot_idx = bitmap->allocate_one();
         if (slot_idx != -1) {
@@ -516,16 +571,26 @@ void ArenaNoHintSpinLock::free(char* ptr, size_t size) {
         return;
     }
 
-    size_t start_slot = (ptr - base) / slot_size;
+    ptrdiff_t offset = ptr - base;
+    if (static_cast<size_t>(offset) % slot_size != 0) {
+        return;
+    }
+    // TODO: Add overflow check for (size + slot_size - 1) if this moves beyond prototype
+    size_t start_slot = static_cast<size_t>(offset) / slot_size;
     size_t slots_to_free = (size + slot_size - 1) / slot_size;
+    if (slots_to_free != 1) {
+        return;
+    }
 
     while (bitmap_spinlock.test_and_set(std::memory_order_acquire)) {
-        // Spin-wait
+        std::this_thread::yield();
     }
-    for (size_t i = start_slot; i < start_slot + slots_to_free && i < bitmap->num_slots; ++i) {
-        bitmap->free_slot(i);
+    if (start_slot < bitmap->num_slots) {
+        auto [word_idx, bit_idx] = bitmap->get_word_and_bit_index_from_slot_index(static_cast<uint32_t>(start_slot));
+        if ((bitmap->words[word_idx] & (1ULL << bit_idx)) == 0) {
+            bitmap->free_slot(static_cast<uint32_t>(start_slot));
+            slots_in_use.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
     bitmap_spinlock.clear(std::memory_order_release);
-
-    slots_in_use.fetch_sub(slots_to_free, std::memory_order_relaxed);
 }

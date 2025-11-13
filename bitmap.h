@@ -24,13 +24,13 @@
 // I was actually going to go for 1 as free and 0 as allocated, but it turns out that we've got hardware support for
 // finding out which bit is set in a given set of bits which makes the allocation of single slots a lot easier.
 struct Bitmap {
-    std::uint32_t WORD_SHIFT = 6;
-    std::uint32_t WORD_LENGTH = 64;
-    std::uint32_t WORD_MASK = 63;
-    std::uint64_t FULLY_ALLOCATED = 0;
-    std::uint64_t FULLY_FREE = UINT64_MAX;
-    // I could likely resuse the mask since it's the same value but that wouldn't be very readable.
-    std::uint64_t MAX_IDX = 63;
+    // Named constants (no magic numbers)
+    static constexpr std::uint32_t WORD_SHIFT = 6;
+    static constexpr std::uint32_t WORD_LENGTH = 64;
+    static constexpr std::uint32_t WORD_MASK = WORD_LENGTH - 1;
+    static constexpr std::uint64_t FULLY_ALLOCATED = 0ULL;
+    static constexpr std::uint64_t FULLY_FREE = UINT64_MAX;
+    static constexpr std::uint32_t MAX_IDX = WORD_LENGTH - 1;
     std::atomic<size_t> allocation_hint;
 
     uint32_t num_slots;
@@ -72,7 +72,9 @@ inline size_t Bitmap::get_slot_index_from_word_and_bit_index(size_t word_idx, ui
 // first pass.
 /// Allocates one free slot from the bitmap, returns the index of the bitmap if allocation was successful, -1 otherwise.
 inline int Bitmap::allocate_one() {
-    for (size_t word_idx = allocation_hint; word_idx < words.size(); ++word_idx) {
+    // Load hint once; this is a non-lock-free bitmap used under external synchronization.
+    size_t hint = allocation_hint.load(std::memory_order_relaxed);
+    for (size_t word_idx = hint; word_idx < words.size(); ++word_idx) {
         uint64_t word = words[word_idx];
         if (word != FULLY_ALLOCATED) {
             // Count leading zeros from the MSB side, subtract from 63 to get the bit index from the right.
@@ -88,15 +90,15 @@ inline int Bitmap::allocate_one() {
             words[word_idx] &= ~(1ULL << bit_idx);
             // Just some hints for the next allocation request to start looking from.
             if (word == FULLY_ALLOCATED) {
-                allocation_hint.store((word_idx + 1) % words.size());
+                allocation_hint.store((word_idx + 1) % words.size(), std::memory_order_relaxed);
             } else {
-                allocation_hint.store(word_idx);
+                allocation_hint.store(word_idx, std::memory_order_relaxed);
             }
             return get_slot_index_from_word_and_bit_index(word_idx, bit_idx);
         }
     }
 
-    for (size_t word_idx = 0; word_idx < allocation_hint; ++word_idx) {
+    for (size_t word_idx = 0; word_idx < hint; ++word_idx) {
         uint64_t word = words[word_idx];
         if (word != FULLY_ALLOCATED) {
             // Count leading zeros from the MSB side, subtract from 63 to get the bit index from the right.
@@ -127,8 +129,12 @@ inline int Bitmap::allocate_many(uint32_t num_slots) {
 }
 
 inline int Bitmap::free_slot(uint32_t slot_idx) {
+    if (slot_idx >= num_slots) {
+        return -1;
+    }
     size_t word_idx, bit_idx;
     std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
+    // word_idx is guaranteed in range if slot_idx < num_slots
     words[word_idx] |= (1ULL << bit_idx);
     // Update hint to point to the word where we just freed a slot
     // This helps allocations find free slots faster
@@ -139,12 +145,12 @@ inline int Bitmap::free_slot(uint32_t slot_idx) {
 // Lock-free bitmap using atomic operations and compare-and-swap for thread-safe allocation.
 // 1 means free, 0 means allocated (same convention as Bitmap).
 struct BitmapLockFree {
-    std::uint32_t WORD_SHIFT = 6;
-    std::uint32_t WORD_LENGTH = 64;
-    std::uint32_t WORD_MASK = 63;
-    std::uint64_t FULLY_ALLOCATED = 0;
-    std::uint64_t FULLY_FREE = UINT64_MAX;
-    std::uint64_t MAX_IDX = 63;
+    static constexpr std::uint32_t WORD_SHIFT = 6;
+    static constexpr std::uint32_t WORD_LENGTH = 64;
+    static constexpr std::uint32_t WORD_MASK = WORD_LENGTH - 1;
+    static constexpr std::uint64_t FULLY_ALLOCATED = 0ULL;
+    static constexpr std::uint64_t FULLY_FREE = UINT64_MAX;
+    static constexpr std::uint32_t MAX_IDX = WORD_LENGTH - 1;
 
     uint32_t num_slots;
     size_t num_words;
@@ -259,6 +265,9 @@ inline int BitmapLockFree::allocate_one() {
 /// Free a previously allocated slot, making it available for reuse.
 /// Uses atomic fetch_or with release semantics to ensure proper memory ordering.
 inline int BitmapLockFree::free_slot(uint32_t slot_idx) {
+    if (slot_idx >= num_slots) {
+        return -1;
+    }
     size_t word_idx;
     uint32_t bit_idx;
     std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
@@ -266,19 +275,25 @@ inline int BitmapLockFree::free_slot(uint32_t slot_idx) {
     // Atomically set the bit to 1 (free)
     // Release semantics ensure that any writes to the slot happen-before
     // the next thread that allocates it (via acquire in allocate_one_lock_free)
-    words[word_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
-    return 0;
+    uint64_t mask = (1ULL << bit_idx);
+    uint64_t old = words[word_idx].fetch_or(mask, std::memory_order_release);
+    if (old & mask) {
+        // Bit was already 1 -> double free detected
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 // Lock-free bitmap with hint mechanism using thread-local counter
 // 1 means free, 0 means allocated (same convention as BitmapLockFree).
 struct BitmapLockFreeHint {
-    std::uint32_t WORD_SHIFT = 6;
-    std::uint32_t WORD_LENGTH = 64;
-    std::uint32_t WORD_MASK = 63;
-    std::uint64_t FULLY_ALLOCATED = 0;
-    std::uint64_t FULLY_FREE = UINT64_MAX;
-    std::uint64_t MAX_IDX = 63;
+    static constexpr std::uint32_t WORD_SHIFT = 6;
+    static constexpr std::uint32_t WORD_LENGTH = 64;
+    static constexpr std::uint32_t WORD_MASK = WORD_LENGTH - 1;
+    static constexpr std::uint64_t FULLY_ALLOCATED = 0ULL;
+    static constexpr std::uint64_t FULLY_FREE = UINT64_MAX;
+    static constexpr std::uint32_t MAX_IDX = WORD_LENGTH - 1;
 
     uint32_t num_slots;
     size_t num_words;
@@ -382,22 +397,30 @@ inline int BitmapLockFreeHint::allocate_one() {
 
 /// Free a previously allocated slot.
 inline int BitmapLockFreeHint::free_slot(uint32_t slot_idx) {
+    if (slot_idx >= num_slots) {
+        return -1;
+    }
     size_t word_idx;
     uint32_t bit_idx;
     std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
-    words[word_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
-    return 0;
+    uint64_t mask = (1ULL << bit_idx);
+    uint64_t old = words[word_idx].fetch_or(mask, std::memory_order_release);
+    if (old & mask) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 // Bitmap without hint mechanism - always scans from the beginning
 // 1 means free, 0 means allocated (same convention as Bitmap).
 struct BitmapNoHint {
-    std::uint32_t WORD_SHIFT = 6;
-    std::uint32_t WORD_LENGTH = 64;
-    std::uint32_t WORD_MASK = 63;
-    std::uint64_t FULLY_ALLOCATED = 0;
-    std::uint64_t FULLY_FREE = UINT64_MAX;
-    std::uint64_t MAX_IDX = 63;
+    static constexpr std::uint32_t WORD_SHIFT = 6;
+    static constexpr std::uint32_t WORD_LENGTH = 64;
+    static constexpr std::uint32_t WORD_MASK = WORD_LENGTH - 1;
+    static constexpr std::uint64_t FULLY_ALLOCATED = 0ULL;
+    static constexpr std::uint64_t FULLY_FREE = UINT64_MAX;
+    static constexpr std::uint32_t MAX_IDX = WORD_LENGTH - 1;
 
     uint32_t num_slots;
     std::vector<uint64_t> words;
@@ -450,6 +473,9 @@ inline int BitmapNoHint::allocate_many(uint32_t num_slots) {
 }
 
 inline int BitmapNoHint::free_slot(uint32_t slot_idx) {
+    if (slot_idx >= num_slots) {
+        return -1;
+    }
     size_t word_idx, bit_idx;
     std::tie(word_idx, bit_idx) = get_word_and_bit_index_from_slot_index(slot_idx);
     words[word_idx] |= (1ULL << bit_idx);
